@@ -1,0 +1,805 @@
+---
+title: "HIV Infection Analysis Dimension Reduction of DMSO, SAHA and PMA Datasets"
+author: 'Oscar Miguel, Pepe Merino, Jordi Resina'
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+
+
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+# Libraries
+
+```{r libraries}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(gridExtra)
+library(RColorBrewer)
+library(ggrepel)
+library(Rtsne)
+library(knitr)
+```
+
+
+
+
+# Introduction
+
+This exploratory study investigates the mechanisms of apoptosis in HIV-infected cell lines. 
+We applied PCA and t-SNE to RNA-seq data (Jurkat and J-Lat2 cells treated with DMSO, SAHA, 
+or PMA across three replicates) as an initial quality control and dimension reduction step 
+prior to differential expression analysis. Since the samples were processed in 
+three distinct batches, we will also evaluate the presence of batch effects
+
+**Experimental design:**
+```{r experimental_design}
+# Overview of the experimental design
+design_summary <- data.frame(
+  Factor = c("Cell line", "Treatment", "Replicates"),
+  Levels = c("Jurkat T cells (HIV-negative), J-Lat2 (latent HIV infection)",
+             "DMSO (control), SAHA (HDAC inhibitor), PMA",
+             "3 independent experiments (rep1, rep2, rep3)")
+)
+kable(design_summary, caption = "Table 1: Summary of the Experimental Design")
+```
+The dataset was provided as a raw counts matrix (genes x samples) and an
+associated sample sheet. Batch effects may be present across replicates and
+normalization will be performed accordingly.
+
+
+
+
+
+# Question 1 – Load, Adapt the Data and Create Metadata
+
+## 1.1 Load the counts matrix
+
+The counts file stores genes as rows and samples as columns.  
+The sample sheet uses `;` as delimiter and contains three metadata variables:
+`cell_type`, `treatment`, and `replicate`.
+
+```{r load_data}
+counts_raw <- read.csv("data/counts.csv", row.names = 1, check.names = FALSE)
+
+sample_sheet <- read.csv("data/sample_sheet.csv", sep = ";", row.names = 1)
+
+cat("Counts matrix dimensions (genes × samples):", dim(counts_raw), "\n")
+cat("Sample sheet dimensions:", dim(sample_sheet), "\n")
+```
+
+## 1.2 Verify dimensions and sample order
+
+We check that every column name in the counts matrix appears exactly once in the
+sample sheet rows, and that their order matches.
+
+```{r verify_order}
+all_present <- all(colnames(counts_raw) %in% rownames(sample_sheet))
+cat("All count columns present in sample sheet:", all_present, "\n")
+
+sample_sheet <- sample_sheet[colnames(counts_raw), ]
+
+order_ok <- all(colnames(counts_raw) == rownames(sample_sheet))
+cat("Sample order matches between counts and metadata:", order_ok, "\n")
+```
+
+## 1.3 Adapt the data – transpose to samples × genes
+
+PCA and t-SNE expect rows = samples, columns = variables (genes).
+
+```{r transpose}
+counts_t <- as.data.frame(t(counts_raw))   # samples × genes
+
+cat("Transposed matrix dimensions (samples × genes):", dim(counts_t), "\n")
+```
+
+## 1.4 Metadata dataframe
+
+```{r metadata}
+metadata <- sample_sheet
+
+metadata$group <- paste(metadata$cell_type, metadata$treatment, sep = "_")
+
+kable(head(metadata, 10), caption = "First 10 rows of the metadata dataframe")
+```
+
+```{r metadata_summary}
+design_tbl <- metadata %>%
+  group_by(cell_type, treatment, replicate) %>%
+  summarise(n_samples = n(), .groups = "drop")
+
+kable(design_tbl, caption = "Experimental design: number of samples per group")
+```
+
+
+Interpretation:
+The experimental design is slightly unbalanced across conditions, as the number of samples
+varies across replicates.The replicate variable indicates the experimental batch, 
+which we will use to track potential batch effects in PCA and t-SNE
+
+
+
+# Question 2 – PCA Representation
+
+## 2.1 Helper function for PCA plotting
+
+We define a reusable function to avoid code duplication.
+
+```{r pca_function}
+run_pca <- function(mat, scale. = FALSE, center = TRUE) {
+  prcomp(mat, scale. = scale., center = center)
+}
+
+pca_var_explained <- function(pca_obj) {
+  var_exp <- pca_obj$sdev^2 / sum(pca_obj$sdev^2) * 100
+  data.frame(
+    PC       = seq_along(var_exp),
+    variance = var_exp
+  )
+}
+
+pca_scores_df <- function(pca_obj, metadata, pc1 = 1, pc2 = 2) {
+  df <- as.data.frame(pca_obj$x[, c(pc1, pc2)])
+  colnames(df) <- c("PC1", "PC2")
+  cbind(df, metadata)
+}
+
+plot_scree <- function(var_df, n = 15, title = "Scree plot") {
+  ggplot(var_df[1:n, ], aes(x = PC, y = variance)) +
+    geom_col(fill = "lightblue2", colour = "white") +
+    geom_line(colour = "darkred", size = 0.8) +
+    geom_point(colour = "darkred", size = 2) +
+    labs(title = title,
+         x = "Principal Component", y = "Variance explained (%)") +
+    theme_bw(base_size = 12)
+}
+
+plot_pca <- function(scores_df, colour_var, shape_var = NULL,
+                     title = "PCA", xlab = "PC1", ylab = "PC2",
+                     palette = NULL) {
+  p <- ggplot(scores_df, aes_string(x = "PC1", y = "PC2",
+                                    colour = colour_var,
+                                    shape  = shape_var)) +
+    geom_point(size = 3, alpha = 0.85) +
+    labs(title = title, x = xlab, y = ylab) +
+    theme_bw(base_size = 12) +  
+    theme(legend.position = "right")
+  if (!is.null(palette)) p <- p + scale_colour_manual(values = palette)
+  p
+}
+```
+
+## 2.2 Raw (non-scaled, non-normalised) PCA
+
+```{r pca_raw}
+pca_raw <- run_pca(counts_t, scale. = FALSE, center = TRUE)
+
+var_raw  <- pca_var_explained(pca_raw)
+sc_raw   <- pca_scores_df(pca_raw, metadata)
+
+xlab_raw <- paste0("PC1 (", round(var_raw$variance[1], 1), "%)")
+ylab_raw <- paste0("PC2 (", round(var_raw$variance[2], 1), "%)")
+
+p1 <- plot_scree(var_raw, title = "Scree plot – Raw counts")
+
+p2 <- plot_pca(sc_raw, colour_var = "cell_type", shape_var = "treatment",
+               title = "PCA – Raw counts (colour = cell type)",
+               xlab = xlab_raw, ylab = ylab_raw)
+
+p3 <- plot_pca(sc_raw, colour_var = "replicate", shape_var = "treatment",
+               title = "PCA – Raw counts (colour = replicate / batch)",
+               xlab = xlab_raw, ylab = ylab_raw)
+#CUANDO HAGA KNIT A VER COMO QUEDA ESTO. (BORRAR COMENTARIO PARA ENTREGAR CODIGO)
+grid.arrange(p1, p2, p3, ncol = 2)
+```
+
+**Interpretation – Raw PCA:** As expected, the PCA on raw counts is heavily dominated by differences in library size rather than biological signal, with highly expressed genes distorting the projection. Grouping by replicate already reveals a noticeable batch effect, as samples from the same condition but different batches separate along PC2.
+
+As expected, the PCA on raw counts is heavily dominated by differences in library size 
+rather than biological signal, with highly expressed genes distorting the projection. 
+Grouping by replicate already reveals a noticeable 
+batch effect, as samples from the same condition but different batches separate along PC2.
+
+## 2.3 Log-normalisation (CPM + log2)
+
+To reduce library-size bias we compute **log2(CPM + 1)**.
+
+```{r normalise}
+library_sizes <- rowSums(counts_t) 
+
+
+counts_cpm <- sweep(counts_t, MARGIN = 1, STATS = library_sizes, FUN = "/") * 1000000
+
+counts_log <- log2(counts_cpm + 1)
+
+cat("Library sizes – summary:\n"); print(summary(library_sizes))
+
+```
+
+```{r boxplot_normalisation, fig.height=5}
+set.seed(42)
+idx <- sample(nrow(counts_t), 20)
+labels_sub <- paste(metadata$cell_type[idx], metadata$treatment[idx],
+                    metadata$replicate[idx], sep = "\n")
+
+par(mfrow = c(1, 2), mar = c(8, 4, 3, 1))
+
+boxplot(t(counts_t[idx, ]),
+        las = 2, cex.axis = 0.5,
+        col  = as.integer(factor(metadata$replicate[idx])) + 1,
+        main = "Raw counts (20 samples)",
+        ylab = "Read counts", names = labels_sub)
+
+boxplot(t(counts_log[idx, ]),
+        las = 2, cex.axis = 0.5,
+        col  = as.integer(factor(metadata$replicate[idx])) + 1,
+        main = "log2(CPM + 1) (20 samples)",
+        ylab = "log2(CPM + 1)", names = labels_sub)
+legend("topright", legend = c("rep1","rep2","rep3"),
+       fill = 2:4, bty = "n", cex = 0.8)
+
+par(mfrow = c(1, 1))
+```
+
+## 2.4 Scaled PCA (z-score across genes)
+
+```{r pca_scaled}
+pca_scaled <- run_pca(counts_t, scale. = TRUE, center = TRUE)
+
+var_scaled  <- pca_var_explained(pca_scaled)
+sc_scaled   <- pca_scores_df(pca_scaled, metadata)
+
+xlab_sc <- paste0("PC1 (", round(var_scaled$variance[1], 1), "%)")
+ylab_sc <- paste0("PC2 (", round(var_scaled$variance[2], 1), "%)")
+
+p4 <- plot_scree(var_scaled, title = "Scree plot – Scaled (z-score)")
+
+p5 <- plot_pca(sc_scaled, colour_var = "cell_type", shape_var = "treatment",
+               title = "PCA – Scaled (colour = cell type)",
+               xlab = xlab_sc, ylab = ylab_sc)
+
+p6 <- plot_pca(sc_scaled, colour_var = "replicate", shape_var = "treatment",
+               title = "PCA – Scaled (colour = replicate / batch)",
+               xlab = xlab_sc, ylab = ylab_sc)
+
+grid.arrange(p4, p5, p6, layout_matrix = rbind(c(1,1), c(2,3)))
+```
+
+## 2.5 PCA on log2(CPM + 1) normalised data
+
+```{r pca_norm}
+pca_norm <- run_pca(counts_log, scale. = FALSE, center = TRUE)
+
+var_norm  <- pca_var_explained(pca_norm)
+sc_norm   <- pca_scores_df(pca_norm, metadata)
+
+xlab_norm <- paste0("PC1 (", round(var_norm$variance[1], 1), "%)")
+ylab_norm <- paste0("PC2 (", round(var_norm$variance[2], 1), "%)")
+
+p7 <- plot_scree(var_norm, title = "Scree plot – log2(CPM+1)")
+
+p8 <- plot_pca(sc_norm, colour_var = "cell_type", shape_var = "treatment",
+               title = "PCA – log2(CPM+1) (colour = cell type)",
+               xlab = xlab_norm, ylab = ylab_norm)
+
+p9 <- plot_pca(sc_norm, colour_var = "replicate", shape_var = "treatment",
+               title = "PCA – log2(CPM+1) (colour = replicate / batch)",
+               xlab = xlab_norm, ylab = ylab_norm)
+
+grid.arrange(p7, p8, p9, layout_matrix = rbind(c(1,1), c(2,3)))
+```
+
+## 2.6 Variance explained – comparison table
+
+```{r var_table}
+var_compare <- data.frame(
+  PC          = 1:10,
+  Raw         = round(var_raw$variance[1:10], 2),
+  Scaled      = round(var_scaled$variance[1:10], 2),
+  log2_CPM    = round(var_norm$variance[1:10], 2)
+)
+kable(var_compare,
+      caption = "% variance explained by PC1–10 under different preprocessing")
+```
+
+## 2.7 Batch effect assessment
+
+```{r batch_effect}
+ggplot(sc_norm, aes(x = PC1, y = PC2,
+                    colour = replicate, shape = cell_type)) +
+  geom_point(size = 3, alpha = 0.85) +
+  facet_wrap(~treatment) +
+  labs(title = "PCA – log2(CPM+1): batch effect check",
+       subtitle = "Colour = replicate (batch), shape = cell type",
+       x = xlab_norm, y = ylab_norm) +
+  scale_colour_brewer(palette = "Set1") +
+  theme_bw(base_size = 12)
+```
+
+**Interpretation – Batch effects:**  
+Visualizing the log-normalized data by replicate confirms a mild batch effect: samples from replicate 1 tend to cluster separately from replicates 2 and 3. However, the biological signal (cell type and treatment) remains the dominant driver of variance. Based on the initial dataset quality control guidelines, no outliers require removal.
+
+## 2.8 PC1/PC2 correlation with metadata variables
+Here we did this Kruskal-Wallis test, because as we only have n=3 replicates, we can't assume normality, 
+making a non-parametric test like Kruskal-Wallis much safer than an ANOVA.
+Also the design is unbalanced, and Kruskal-Wallis handles unequal group sizes and variances better, 
+avoiding potential false positives.
+It works for both 2 groups (cell type) and 3 groups (treatment), so we could use the same statistical test 
+for every variable.
+This allowed us to wrap everything in a for loop, making the code much cleaner, more efficient, and easier to automate.
+
+```{r pc_correlation}
+covariables <- c("cell_type", "treatment", "replicate")
+
+pc_pvals <- data.frame(
+  PC1_p = sapply(covariables, function(x) kruskal.test(sc_norm$PC1 ~ as.factor(sc_norm[[x]]))$p.value),
+  PC2_p = sapply(covariables, function(x) kruskal.test(sc_norm$PC2 ~ as.factor(sc_norm[[x]]))$p.value)
+)
+
+print(round(pc_pvals, 4))
+```
+
+```{r pc_boxplots, fig.height=5}
+b1 <- ggplot(sc_norm, aes(x = cell_type, y = PC1, fill = cell_type)) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "PC1 by cell type", x = NULL) +
+  theme_bw(base_size = 11) + theme(legend.position = "none")
+
+b2 <- ggplot(sc_norm, aes(x = treatment, y = PC2, fill = treatment)) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "PC2 by treatment", x = NULL) +
+  theme_bw(base_size = 11) + theme(legend.position = "none")
+
+b3 <- ggplot(sc_norm, aes(x = replicate, y = PC1, fill = replicate)) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = "PC1 by replicate (batch)", x = NULL) +
+  theme_bw(base_size = 11) + theme(legend.position = "none")
+
+b4 <- ggplot(sc_norm, aes(x = replicate, y = PC2, fill = replicate)) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = "PC2 by replicate (batch)", x = NULL) +
+  theme_bw(base_size = 11) + theme(legend.position = "none")
+
+grid.arrange(b1, b2, b3, b4, nrow = 2)
+```
+
+**Interpretation – PC correlation:**  
+Statistical testing (Kruskal-Wallis) confirms:  
+- PC1 is strongly associated with cell type (Jurkat vs. J-LatA2).  
+- PC2 is associated with treatment (DMSO vs. SAHA vs. PMA).  
+- Replicate / batch shows moderate influence on both PCs, confirming a batch
+  effect that warrants downstream correction before differential expression.
+
+
+
+# Question 3 – t-SNE Representation
+
+## 3.1 Helper function for t-SNE
+
+```{r tsne_function}
+run_tsne <- function(mat, perplexity = 30, max_iter = 1000,
+                     check_duplicates = FALSE, pca = TRUE, seed = 42) {
+  set.seed(seed)
+  Rtsne(as.matrix(mat),
+        perplexity       = perplexity,
+        max_iter         = max_iter,
+        check_duplicates = check_duplicates,
+        pca              = pca,
+        verbose          = FALSE)
+}
+
+plot_tsne <- function(tsne_obj, metadata, colour_var, shape_var = NULL,
+                      title = "t-SNE", palette = NULL) {
+  df <- data.frame(
+    tSNE1 = tsne_obj$Y[, 1],
+    tSNE2 = tsne_obj$Y[, 2],
+    metadata
+  )
+  p <- ggplot(df, aes_string(x = "tSNE1", y = "tSNE2",
+                              colour = colour_var,
+                              shape  = shape_var)) +
+    geom_point(size = 3, alpha = 0.85) +
+    labs(title = title, x = "t-SNE 1", y = "t-SNE 2") +
+    theme_bw(base_size = 12)
+  if (!is.null(palette)) p <- p + scale_colour_manual(values = palette)
+  p
+}
+```
+
+## 3.2 t-SNE on raw counts
+
+```{r tsne_raw, cache=TRUE}
+tsne_raw <- run_tsne(counts_t, perplexity = 30)
+
+p_tsne_raw_ct <- plot_tsne(tsne_raw, metadata,
+  colour_var = "cell_type", shape_var = "treatment",
+  title = "t-SNE – Raw counts (colour = cell type)")
+
+p_tsne_raw_rep <- plot_tsne(tsne_raw, metadata,
+  colour_var = "replicate", shape_var = "treatment",
+  title = "t-SNE – Raw counts (colour = replicate)")
+
+grid.arrange(p_tsne_raw_ct, p_tsne_raw_rep, ncol = 2)
+```
+
+## 3.3 t-SNE on log2(CPM + 1) normalised data
+
+```{r tsne_norm, cache=TRUE}
+tsne_norm <- run_tsne(counts_log, perplexity = 30)
+
+p_tsne_norm_ct <- plot_tsne(tsne_norm, metadata,
+  colour_var = "cell_type", shape_var = "treatment",
+  title = "t-SNE – log2(CPM+1) (colour = cell type)")
+
+p_tsne_norm_rep <- plot_tsne(tsne_norm, metadata,
+  colour_var = "replicate", shape_var = "treatment",
+  title = "t-SNE – log2(CPM+1) (colour = replicate)")
+
+grid.arrange(p_tsne_norm_ct, p_tsne_norm_rep, ncol = 2)
+```
+
+## 3.4 Comparison: raw vs. normalised t-SNE
+
+```{r tsne_comparison}
+df_raw  <- data.frame(tsne_raw$Y,  metadata, data = "Raw counts")
+df_norm <- data.frame(tsne_norm$Y, metadata, data = "log2(CPM+1)")
+colnames(df_raw)[1:2] <- colnames(df_norm)[1:2] <- c("tSNE1","tSNE2")
+
+df_both <- rbind(df_raw, df_norm)
+
+ggplot(df_both, aes(x = tSNE1, y = tSNE2, colour = cell_type, shape = treatment)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  facet_wrap(~data, scales = "free") +
+  scale_colour_brewer(palette = "Set2") +
+  labs(title = "t-SNE comparison: raw vs. normalised",
+       colour = "Cell type", shape = "Treatment") +
+  theme_bw(base_size = 12)
+```
+
+**Interpretation – t-SNE:**  
+- In raw counts, t-SNE is distorted by library size differences and does not
+  produce clean biological clusters.  
+- On log2(CPM+1) data, two large clusters emerge corresponding to
+  Jurkat and J-LatA2 cell lines. Within each, treatment sub-clusters
+  are visible (especially PMA, which triggers a strong transcriptional
+  response).  
+- Compared to PCA, t-SNE captures non-linear structure and reveals finer
+  sub-grouping by treatment. However, t-SNE distances between clusters are not
+  directly interpretable as in PCA.
+- Batch/replicate effects are visible but less dominant than the biological
+  signal, consistent with the PCA findings.
+
+
+
+# Question 4 – t-SNE Parameters
+
+All parameter explorations use the **log2(CPM+1)** normalised matrix only.
+
+## 4.1 Reproducibility – effect of random seed
+
+t-SNE is stochastic. Running it with different seeds can produce different
+orientations or slightly different cluster shapes.
+
+```{r tsne_reproducibility, cache=TRUE, fig.height=9}
+seeds <- c(1, 42, 123, 999)
+
+tsne_seed_list <- lapply(seeds, function(s) {
+  set.seed(s)
+  Rtsne(as.matrix(counts_log), perplexity = 30, max_iter = 1000,
+        check_duplicates = FALSE, pca = TRUE, verbose = FALSE)
+})
+
+plots_seeds <- lapply(seq_along(seeds), function(i) {
+  df <- data.frame(tSNE1 = tsne_seed_list[[i]]$Y[,1],
+                   tSNE2 = tsne_seed_list[[i]]$Y[,2],
+                   cell_type = metadata$cell_type,
+                   treatment = metadata$treatment)
+  ggplot(df, aes(x = tSNE1, y = tSNE2, colour = cell_type, shape = treatment)) +
+    geom_point(size = 2, alpha = 0.8) +
+    scale_colour_brewer(palette = "Set2") +
+    labs(title = paste("Seed =", seeds[i])) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "none")
+})
+
+legend_p <- ggplot(data.frame(tSNE1=1, tSNE2=1,
+                               cell_type=metadata$cell_type,
+                               treatment=metadata$treatment),
+                   aes(x=tSNE1, y=tSNE2, colour=cell_type, shape=treatment)) +
+  geom_point(size=3) + scale_colour_brewer(palette="Set2") +
+  theme_bw() + theme(legend.position="right")
+
+grid.arrange(grobs = c(plots_seeds, list(legend_p)),
+             ncol = 2,
+             top = "t-SNE reproducibility: different random seeds (perplexity=30)")
+```
+
+**Comment:** The overall cluster topology (Jurkat vs. J-LatA2 separation, treatment
+sub-clusters) is reproduced across seeds, confirming the structure is robust.
+Mirror images and rotations between runs are expected and do not affect
+interpretation — t-SNE distances are not globally interpretable.
+
+## 4.2 Effect of perplexity
+
+Perplexity controls the effective number of nearest neighbours and strongly
+influences cluster shape.
+
+```{r tsne_perplexity, cache=TRUE, fig.height=9}
+perplexities <- c(5, 15, 30, 50, 100)
+n_samples <- nrow(counts_log)
+max_perp <- floor((n_samples - 1) / 3)
+cat("Max valid perplexity:", max_perp, "\n")
+
+perplexities <- perplexities[perplexities < max_perp]
+
+tsne_perp_list <- lapply(perplexities, function(p) {
+  set.seed(42)
+  Rtsne(as.matrix(counts_log), perplexity = p, max_iter = 1000,
+        check_duplicates = FALSE, pca = TRUE, verbose = FALSE)
+})
+
+plots_perp <- lapply(seq_along(perplexities), function(i) {
+  df <- data.frame(tSNE1 = tsne_perp_list[[i]]$Y[,1],
+                   tSNE2 = tsne_perp_list[[i]]$Y[,2],
+                   cell_type = metadata$cell_type,
+                   treatment = metadata$treatment)
+  ggplot(df, aes(x = tSNE1, y = tSNE2, colour = cell_type, shape = treatment)) +
+    geom_point(size = 2, alpha = 0.8) +
+    scale_colour_brewer(palette = "Set2") +
+    labs(title = paste("Perplexity =", perplexities[i])) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "none")
+})
+
+do.call(grid.arrange, c(plots_perp,
+                         list(ncol = 2,
+                              top = "t-SNE: effect of perplexity (seed=42, iter=1000)")))
+```
+
+## 4.3 Finding perplexity limits
+
+```{r perplexity_limits}
+cat("Dataset: n =", nrow(counts_log), "samples\n")
+cat("Maximum theoretically valid perplexity: <", max_perp, "\n\n")
+
+perp_test <- c(2, 5, 10, 20, 30, 50, 80)
+valid <- perp_test[perp_test < max_perp]
+cat("Valid perplexity values tested:", paste(valid, collapse=", "), "\n")
+```
+
+- Very low perplexity (5) creates many small, fragmented clusters — noise
+  is over-emphasised and global structure is lost.  
+- Moderate perplexity (30–50) gives well-separated, biologically
+  interpretable clusters and is commonly used for datasets of this size.  
+- High perplexity (80–100) starts collapsing clusters and approaching a
+  PCA-like linear projection.  
+- The theoretical upper bound is `(n − 1) / 3`; values beyond this cause an
+  error in Rtsne. For n = `r nrow(counts_log)` samples, the maximum is
+  `r max_perp`.
+
+## 4.4 Effect of iterations (max_iter)
+
+```{r tsne_iterations, cache=TRUE, fig.height=9}
+iterations <- c(100, 250, 500, 1000, 2000)
+
+tsne_iter_list <- lapply(iterations, function(it) {
+  set.seed(42)
+  Rtsne(as.matrix(counts_log), perplexity = 30, max_iter = it,
+        check_duplicates = FALSE, pca = TRUE, verbose = FALSE)
+})
+
+plots_iter <- lapply(seq_along(iterations), function(i) {
+  df <- data.frame(tSNE1 = tsne_iter_list[[i]]$Y[,1],
+                   tSNE2 = tsne_iter_list[[i]]$Y[,2],
+                   cell_type = metadata$cell_type,
+                   treatment = metadata$treatment)
+  ggplot(df, aes(x = tSNE1, y = tSNE2, colour = cell_type, shape = treatment)) +
+    geom_point(size = 2, alpha = 0.8) +
+    scale_colour_brewer(palette = "Set2") +
+    labs(title = paste("max_iter =", iterations[i])) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "none")
+})
+
+do.call(grid.arrange, c(plots_iter,
+                         list(ncol = 2,
+                              top = "t-SNE: effect of iterations (perplexity=30, seed=42)")))
+```
+
+- At 100 iterations the embedding has not converged — clusters are
+  diffuse and poorly separated.  
+- By 500 iterations most structure is already in place.  
+- 1000 iterations (default) is typically sufficient for convergence.  
+- Beyond 1000, results are very similar — additional iterations provide
+  diminishing returns.
+
+
+
+# Question 5 – Final Interpretation
+
+## 5.1 Final PCA – polished plot
+
+```{r final_pca}
+group_colours <- c(
+  "Jurkat_DMSO"   = "steelblue",
+  "Jurkat_SAHA"   = "lightblue",
+  "Jurkat_PMA"    = "darkorange",
+  "J-LatA2_DMSO"  = "turquoise",
+  "J-LatA2_SAHA"  = "forestgreen",
+  "J-LatA2_PMA"   = "red3"
+)
+
+ggplot(sc_norm, aes(x = PC1, y = PC2,
+                    colour = group, shape = replicate)) +
+  geom_point(size = 3.5, alpha = 0.85) +
+  scale_colour_manual(values = group_colours) +
+  labs(
+    title    = "Final PCA – HIV dataset (log2 CPM+1)",
+    subtitle = paste0(xlab_norm, " | ", ylab_norm),
+    x = xlab_norm, y = ylab_norm,
+    colour = "Group (cell type × treatment)",
+    shape  = "Replicate (batch)"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "right",
+        plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"))
+```
+
+## 5.2 Final t-SNE – polished plot
+
+```{r final_tsne}
+df_tsne_final <- data.frame(
+  tSNE1 = tsne_norm$Y[, 1],
+  tSNE2 = tsne_norm$Y[, 2],
+  metadata
+)
+
+ggplot(df_tsne_final, aes(x = tSNE1, y = tSNE2,
+                           colour = group, shape = replicate)) +
+  geom_point(size = 3.5, alpha = 0.85) +
+  scale_colour_manual(values = group_colours) +
+  labs(
+    title    = "Final t-SNE – HIV dataset (log2 CPM+1, perplexity=30, iter=1000)",
+    x = "t-SNE 1", y = "t-SNE 2",
+    colour = "Group (cell type × treatment)",
+    shape  = "Replicate (batch)"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "right",
+        plot.title = element_text(face = "bold"))
+```
+
+## 5.3 PC1 and PC2 biological interpretation
+
+```{r loadings}
+loadings <- as.data.frame(pca_norm$rotation[, 1:2])
+colnames(loadings) <- c("PC1", "PC2")
+
+top_pc1 <- loadings[order(abs(loadings$PC1), decreasing = TRUE), ][1:15,]
+top_pc2 <- loadings[order(abs(loadings$PC2), decreasing = TRUE), ][1:15,]
+
+kable(top_pc1, caption = "Top 15 genes contributing to PC1", digits = 5)
+kable(top_pc2, caption = "Top 15 genes contributing to PC2", digits = 5)
+```
+
+```{r loading_plots, fig.height=5}
+l1 <- ggplot(top_pc1, aes(x = reorder(rownames(top_pc1), abs(PC1)),
+                           y = PC1, fill = PC1 > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("red","blue"), guide = "none") +
+  labs(title = "Top gene loadings – PC1", x = "Gene", y = "Loading") +
+  theme_bw(base_size = 10)
+
+l2 <- ggplot(top_pc2, aes(x = reorder(rownames(top_pc2), abs(PC2)),
+                           y = PC2, fill = PC2 > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("red","blue"), guide = "none") +
+  labs(title = "Top gene loadings – PC2", x = "Gene", y = "Loading") +
+  theme_bw(base_size = 10)
+
+grid.arrange(l1, l2, ncol = 2)
+```
+
+## 5.4 Side-by-side final comparison
+
+```{r side_by_side, fig.height=8, fig.width=12}
+pca_final <- ggplot(sc_norm,
+  aes(x = PC1, y = PC2, colour = group, shape = replicate)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_manual(values = group_colours) +
+  labs(title = "PCA (log2 CPM+1)", x = xlab_norm, y = ylab_norm,
+       colour = "Group", shape = "Replicate") +
+  theme_bw(base_size = 12)
+
+tsne_final <- ggplot(df_tsne_final,
+  aes(x = tSNE1, y = tSNE2, colour = group, shape = replicate)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_manual(values = group_colours) +
+  labs(title = "t-SNE (log2 CPM+1, perplexity=30)",
+       x = "t-SNE 1", y = "t-SNE 2",
+       colour = "Group", shape = "Replicate") +
+  theme_bw(base_size = 12)
+
+grid.arrange(pca_final, tsne_final, ncol = 2)
+```
+
+## 5.5 Conclusions
+
+**Do PCA and t-SNE lead to the same conclusions?**
+
+```{r methods_comparison}
+# Summary comparison between PCA and t-SNE
+comparison <- data.frame(
+  Aspect = c("Primary separation", 
+             "Secondary separation", 
+             "Batch effect visible?", 
+             "Outliers detected?", 
+             "Interpretability"),
+  PCA = c("Cell type (Jurkat vs J-LatA2) on PC1", 
+          "Treatment (PMA most distinct) on PC2", 
+          "Yes, replicates overlap partially", 
+          "No", 
+          "PCs have defined meaning (% variance)"),
+  t_SNE = c("Cell type in distinct clusters", 
+            "Treatment sub-clusters within each cell line", 
+            "Yes, same pattern", 
+            "No", 
+            "Axes are arbitrary; cluster shape meaningful")
+)
+kable(comparison, caption = "Table 2: PCA vs t-SNE Conclusions")
+```
+
+**Both methods agree on the key biological findings:**
+
+1. **Cell type is the strongest source of variation.** Jurkat (HIV-negative)
+   and J-LatA2 (latent HIV) separate clearly along the first axis in both PCA
+   and t-SNE. This is expected: the two cell lines differ in HIV integration
+   status and baseline transcriptome.
+
+2. **Treatment drives secondary variation.** PMA (a strong PKC activator that
+   reactivates HIV) induces the most distinct transcriptional response, while
+   DMSO (control) and SAHA show intermediate divergence.
+
+3. **A mild batch effect is present.** Samples from the same condition but
+   different replicates do not fully overlap. This batch effect should be
+   corrected (with ComBat or limma's `removeBatchEffect`) before
+   differential expression analysis.
+
+4. **No outliers detected**, consistent with the dataset description.
+
+5. **t-SNE provides additional resolution** within sub-groups that PCA
+   compresses, making it complementary rather than redundant.
+
+6. **Normalisation is essential.** Raw counts produce PCA/t-SNE projections
+   dominated by library-size artefacts. Log2(CPM+1) normalisation corrects
+   this and reveals the true biological structure.
+
+
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```
