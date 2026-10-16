@@ -1,0 +1,1994 @@
+---
+title: "HIV Infection Analysis Dimension Reduction of DMSO, SAHA and PMA Datasets"
+author: 'Oscar Miguel, Pepe Merino, Jordi Resina'
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: 
+      smooth_scroll: true
+    toc_depth: 4
+    theme: lumen
+    highlight: tango
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 6,
+  fig.align  = "center"
+)
+```
+
+# Libraries
+
+```{r libraries}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(gridExtra)
+library(RColorBrewer)
+library(ggrepel)
+library(Rtsne)
+library(patchwork)
+library(knitr)
+library(umap)
+library(cluster)
+library(plotly)
+
+
+```
+
+```{r custom_theme, echo=FALSE}
+theme_hospital_bio <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.background   = element_rect(fill = "#FCFBFB", colour = NA),
+      panel.background  = element_rect(fill = "#FFFFFF", colour = NA),
+      
+      panel.grid.major  = element_line(colour = "#F5E6E6", linewidth = 0.5),
+      panel.grid.minor  = element_blank(),
+      
+      plot.title        = element_text(face = "bold", colour = "#800000", size = rel(1.2)),
+      plot.subtitle     = element_text(colour = "#A5696D"),
+      axis.title        = element_text(face = "bold", colour = "#4A2323"),
+      axis.text         = element_text(colour = "#5C3A3A"),
+      
+      legend.title      = element_text(face = "bold", colour = "#800000"),
+      legend.text       = element_text(colour = "#4A2323"),
+      
+      strip.background  = element_rect(fill = "#FADBD8", colour = NA),
+      strip.text        = element_text(face = "bold", colour = "#78281F")
+    )
+}
+
+theme_set(theme_hospital_bio())
+
+```
+
+```{r global_palette, echo=FALSE}
+# PALETA
+treatment_colours <- c(
+  "DMSO" = "#2E86C1",
+  "SAHA" = "#E67E22",
+  "PMA"  = "#C0392B"
+)
+
+group_colours <- c(
+  "Jurkat_DMSO"   = "#2E86C1",
+  "Jurkat_SAHA"   = "#E67E22",
+  "Jurkat_PMA"    = "#C0392B",
+  "J-LatA2_DMSO"  = "#1A5276",
+  "J-LatA2_SAHA"  = "#B45F06",
+  "J-LatA2_PMA"   = "#7B241C"
+)
+
+cell_shapes <- c("Jurkat" = 16, "J-LatA2" = 17)
+replicate_shapes <- c("rep1" = 16, "rep2" = 17, "rep3" = 15)
+
+```
+# Introduction
+
+This transcriptomic study investigates apoptosis mechanisms in HIV
+infection using uninfected Jurkat and latently infected J-Lat T-cell
+lines.
+
+Cells were treated with a DMSO vehicle control, or latency-reversing
+drugs: SAHA (an HDAC inhibitor) and PMA (a PKC activator). The
+experiment was executed in three independent blocks, generating a
+high-dimensional dataset of 18 total sample profiles. To optimize RAM
+performance during heavy algebraic steps, the raw counts dataframe
+should be handled as a primitive matrix. Systemic noise from sequencing
+depth variations requires strict library-size normalization (e.g., TMM
+or Median of Ratios). Because data was collected across separate
+experimental blocks, mathematical batch-effect correction must be
+applied to remove technical artifacts.
+
+Exploratory dimension reduction via PCA or UMAP will be used to
+visualize sample clustering and ensure data quality. The pipeline
+contains no outliers, setting a reliable baseline to isolate true
+biological variance across the conditions. Ultimately, this setup
+enables targeted differential expression analysis to track
+transcriptomic shifts governing apoptotic pathways. Interactive volcano
+plots, boxplots, and tabsets will be deployed to dynamically interpret
+the downstream genomic results.
+
+**Experimental design:**
+
+```{r experimental_design}
+design_summary <- data.frame(
+  Factor = c("Cell line", "Treatment", "Replicates"),
+  Levels = c("Jurkat T cells (HIV-negative), J-Lat2 (latent HIV infection)",
+             "DMSO (control), SAHA (HDAC inhibitor), PMA",
+             "3 independent experiments (rep1, rep2, rep3)")
+)
+kable(design_summary, caption = "Table 1: Summary of the Experimental Design")
+```
+
+The dataset was provided as a raw counts matrix (genes x samples) and an
+associated sample sheet. Batch effects may be present across replicates
+and normalization will be performed accordingly.
+
+# Assembling dataset
+
+## Question 1 – Load, Adapt the Data and Create Metadata
+
+## 1.1 Load the counts matrix
+
+The counts file stores genes as rows and samples as columns.\
+The sample sheet uses `;` as delimiter and contains three metadata
+variables: `cell_type`, `treatment`, and `replicate`.
+
+```{r load_data}
+counts_raw <- read.csv("counts.csv", row.names = 1, check.names = FALSE)
+
+sample_sheet <- read.csv("sample_sheet.csv", sep = ";", row.names = 1)
+
+cat("Counts matrix dimensions (genes × samples):", dim(counts_raw), "\n")
+cat("Sample sheet dimensions:", dim(sample_sheet), "\n")
+```
+
+## 1.2 Verify dimensions and sample order
+
+We check that every column name in the counts matrix appears exactly
+once in the sample sheet rows, and that their order matches.
+
+```{r verify_order}
+all_present <- all(colnames(counts_raw) %in% rownames(sample_sheet))
+cat("All count columns present in sample sheet:", all_present, "\n")
+
+sample_sheet <- sample_sheet[colnames(counts_raw), ]
+
+order_ok <- all(colnames(counts_raw) == rownames(sample_sheet))
+cat("Sample order matches between counts and metadata:", order_ok, "\n")
+```
+
+## 1.3 Adapt the data – transpose to samples × genes
+
+::: {style="background-color: #f4f6f7; padding: 12px; border-left: 4px solid #7f8c8d; margin-bottom: 15px; border-radius: 4px;"}
+**Technical Design Note:** Dimensionality reduction algorithms (PCA, t-SNE, and UMAP) strictly expect the data matrix to be structured with rows representing observations (samples) and columns representing features or variables (genes).
+:::
+
+```{r transpose}
+counts_t <- as.data.frame(t(counts_raw))   # samples × genes
+
+cat("Transposed matrix dimensions (samples × genes):", dim(counts_t), "\n")
+```
+
+## 1.4 Metadata dataframe
+
+```{r metadata}
+metadata <- sample_sheet
+
+metadata$group <- paste(metadata$cell_type, metadata$treatment, sep = "_")
+
+kable(head(metadata, 10), caption = "First 10 rows of the metadata dataframe")
+```
+
+```{r metadata_summary}
+design_tbl <- metadata %>%
+  group_by(cell_type, treatment, replicate) %>%
+  summarise(n_samples = n(), .groups = "drop")
+
+kable(design_tbl, caption = "Experimental design: number of samples per group")
+```
+
+Interpretation: Sample size variation across replicates introduces a
+slight imbalance to the experimental design. Consequently, the replicate
+variable will serve to detect potential batch effects in the down-stream
+PCA and t-SNE dimension reductions.
+
+# PCA
+
+## Question 2 – PCA Representation
+
+### 2.1 Helper function for PCA plotting
+
+We define a reusable function to avoid code duplication.
+
+```{r pca_function}
+run_pca <- function(mat, scale. = FALSE, center = TRUE) {
+  prcomp(mat, scale. = scale., center = center)
+}
+
+pca_var_explained <- function(pca_obj) {
+  var_exp <- pca_obj$sdev^2 / sum(pca_obj$sdev^2) * 100
+  data.frame(
+    PC       = seq_along(var_exp),
+    variance = var_exp
+  )
+}
+
+pca_scores_df <- function(pca_obj, metadata, pc1 = 1, pc2 = 2) {
+  df <- as.data.frame(pca_obj$x[, c(pc1, pc2)])
+  colnames(df) <- c("PC1", "PC2")
+  cbind(df, metadata)
+}
+
+plot_scree <- function(var_df, n = 15, title = "Scree plot") {
+  ggplot(var_df[1:n, ], aes(x = PC, y = variance)) +
+    geom_col(fill = "lightblue2", colour = "white") +
+    geom_line(colour = "darkred", size = 0.8) +
+    geom_point(colour = "darkred", size = 2) +
+    labs(title = title,
+         x = "Principal Component", y = "Variance explained (%)") 
+}
+
+plot_pca <- function(scores_df, colour_var, shape_var = NULL,
+                     title = "PCA", xlab = "PC1", ylab = "PC2",
+                     palette = NULL) {
+  p <- ggplot(scores_df, aes_string(x = "PC1", y = "PC2",
+                                    colour = colour_var,
+                                    shape  = shape_var)) +
+    geom_point(size = 3, alpha = 0.85) +
+    labs(title = title, x = xlab, y = ylab) +
+    theme(legend.position = "right")
+  if (!is.null(palette)) p <- p + scale_colour_manual(values = palette)
+  p
+}
+```
+
+### 2.2 Raw (non-scaled, non-normalised) PCA
+
+```{r pca_raw}
+pca_raw <- run_pca(counts_t, scale. = FALSE, center = TRUE)
+
+var_raw  <- pca_var_explained(pca_raw)
+sc_raw   <- pca_scores_df(pca_raw, metadata)
+
+xlab_raw <- paste0("PC1 (", round(var_raw$variance[1], 1), "%)")
+ylab_raw <- paste0("PC2 (", round(var_raw$variance[2], 1), "%)")
+
+p1 <- plot_scree(var_raw, title = "Scree plot – Raw counts")
+
+p2 <- plot_pca(sc_raw, colour_var = "cell_type", shape_var = "treatment",
+               title = "PCA – Raw counts (colour = cell type)",
+               xlab = xlab_raw, ylab = ylab_raw)
+
+p3 <- plot_pca(sc_raw, colour_var = "replicate", shape_var = "treatment",
+               title = "PCA – Raw counts (colour = replicate / batch)",
+               xlab = xlab_raw, ylab = ylab_raw)
+grid.arrange(p1, p2, p3, ncol = 2)
+```
+
+**Interpretation – Raw PCA:**
+
+::: {style="background-color: #e8f5e9; color: #1b5e20; padding: 15px; border-left: 6px solid #2e7d32; border-radius: 5px;"}
+As expected, the PCA on raw counts is heavily dominated by differences
+in library size rather than biological signal, with highly expressed
+genes distorting the projection. Grouping by replicate already reveals a
+noticeable batch effect, as samples from the same condition but
+different batches separate along PC2.
+:::
+
+::: {style="background-color: #eceff1; color: #263238; padding: 15px; border-left: 6px solid #455a64; border-radius: 5px;"}
+If we try to interpret this biologically, it would mean that our cells
+are suffering a massive global amplification of transcription, or that
+the Jurkat and J-Lat2 lines are fundamentally changing their core
+identity between replicate 1, 2, and 3. But obviously, this is
+impossible because they are biological clones and we standardized the
+RNA input before the library preparation. What we are really seeing here
+is just a technical artifact: the massive differences in library size
+depend on things like pipetting or sequencing depth, and the separation
+in PC2 is a clear batch effect caused by doing the experiment on
+different days or with different media, not real biology.
+:::
+
+### 2.3 Total expression normalisation
+
+To reduce library-size bias we perform a total expression normalization
+as requested.
+
+```{r normalise}
+genes_total <- colSums(counts_t)
+counts_clean <- counts_t[, genes_total > 0]
+
+sample_totals <- rowSums(counts_clean)
+
+counts_norm_raw <- counts_clean / sample_totals
+
+cat("Sample totals – summary:\n"); print(summary(sample_totals))
+
+
+```
+
+
+```{r raw_vs_normalized_comparison, fig.height=7}
+set.seed(42)
+sample_idx <- sample(1:nrow(counts_t), 15)
+
+df_raw_plot <- data.frame(
+  Sample = rep(rownames(counts_t)[sample_idx], each = ncol(counts_t)),
+  Expression = as.vector(t(counts_t[sample_idx, ])),
+  Type = "Raw Counts"
+)
+
+df_norm_plot <- data.frame(
+  Sample = rep(rownames(counts_norm_raw)[sample_idx], each = ncol(counts_norm_raw)),
+  Expression = as.vector(t(counts_norm_raw[sample_idx, ])),
+  Type = "Normalized"
+)
+
+df_combined <- rbind(df_raw_plot, df_norm_plot)
+
+p_boxplot <- ggplot(df_combined, aes(x = Sample, y = log10(Expression + 1), fill = Type)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
+  facet_wrap(~Type, nrow = 2) +
+  labs(title = "Raw vs Normalized Expression Distribution",
+       subtitle = "log10 transformation for visualization | Normalization removes library size bias",
+       x = "Samples", y = "log10(Expression + 1)") +
+  theme_hospital_bio() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8), legend.position = "none")
+
+p_density <- ggplot(df_combined, aes(x = log10(Expression + 1), colour = Type, fill = Type)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Density Comparison",
+       subtitle = "Normalized data shows more consistent distribution across samples",
+       x = "log10(Expression + 1)", y = "Density") +
+  scale_colour_manual(values = c("Raw Counts" = "#C0392B", "Normalized" = "#2E86C1")) +
+  scale_fill_manual(values = c("Raw Counts" = "#C0392B", "Normalized" = "#2E86C1")) +
+  theme_hospital_bio()
+
+p_boxplot / p_density
+```
+
+```{r boxplot_normalisation, fig.height=5}
+
+set.seed(42)
+idx <- sample(nrow(counts_t), 20)
+
+labels_sub <- paste(metadata$cell_type[idx], metadata$treatment[idx],
+                    metadata$replicate[idx], sep = "\n")
+
+base_groups <- paste(metadata$cell_type[idx], metadata$treatment[idx], sep = "_")
+base_colors <- group_colours[base_groups]
+
+get_solid_intensity <- function(color, rep) {
+  rep_num <- as.numeric(gsub("[^0-9]", "", as.character(rep)))
+  
+  if (is.na(rep_num) || rep_num == 2) {
+    return(color) 
+  } else if (rep_num == 1) {
+    return(colorRampPalette(c("white", color))(5)[3]) 
+  } else {
+    return(colorRampPalette(c("black", color))(5)[3])
+  }
+}
+
+final_colors <- mapply(get_solid_intensity, base_colors, metadata$replicate[idx])
+
+par(mfrow = c(1, 2), mar = c(8, 4, 3, 1))
+
+boxplot(t(counts_t[idx, ]),
+        las = 2, cex.axis = 0.5,
+        col  = final_colors,
+        main = "Raw counts (20 samples)",
+        ylab = "Read counts", names = labels_sub)
+
+boxplot(t(counts_norm_raw[idx, ]),
+        las = 2, cex.axis = 0.5,
+        col  = final_colors,
+        main = "Normalized (20 samples)",
+        ylab = "Normalized", names = labels_sub)
+
+legend_colors <- c(
+  colorRampPalette(c("white", "gray50"))(5)[3], 
+  "gray50",                                     
+  colorRampPalette(c("black", "gray50"))(5)[3]  
+)
+
+legend("topright", legend = c("Rep 1 (Lighter)", "Rep 2 (Base)", "Rep 3 (Darker)"),
+       fill = legend_colors, bty = "n", cex = 0.8, title = "Intensity by Replicate")
+par(mfrow = c(1, 1))
+
+```
+::: {style="background-color: #e8f5e9; color: #1b5e20; padding: 15px; border-left: 6px solid #2e7d32; border-radius: 5px;"}
+1. Log-Transformed Boxplots (Raw vs Normalized Expression Distribution)
+In this plot, we attempted to display the expression distributions using a log 10.
+(Expression+1) transformation. While the raw counts show expected biological variability, our normalized data appears as a completely flat line at zero. This is a mathematical artifact: because dividing by total counts produced minuscule fractions, the log 
+10 (x+1) transformation artificially compressed all our variance into a single baseline point.
+
+2. Density Comparison Plot
+This density plot further confirms the mathematical artifact introduced by our logarithmic transformation. Our normalized data (blue line) collapses entirely into a single vertical spike at zero, losing all structural resolution of the transcriptomic profiles. Conversely, the raw counts (red line) spread normally across the axis, demonstrating that this specific log transformation is incompatible with our proportional data.
+
+3. Raw Counts vs Normalized
+By plotting a subset of twenty samples without any log transformation, we can finally observe the true success of our normalization strategy. The left panel reveals the severe sequencing depth bias present in our raw counts, with massive differences in total reads. On the right, our normalized data shows beautifully leveled distributions, proving we successfully eliminated technical library-size artifacts to isolate the true biological signal.
+:::
+### 2.4 Scaled PCA (z-score across genes)
+
+
+```{r pca_scaled}
+
+pca_scaled <- run_pca(counts_t, scale. = TRUE, center = TRUE)
+
+var_scaled  <- pca_var_explained(pca_scaled)
+sc_scaled   <- pca_scores_df(pca_scaled, metadata)
+
+xlab_sc <- paste0("PC1 (", round(var_scaled$variance[1], 1), "%)")
+ylab_sc <- paste0("PC2 (", round(var_scaled$variance[2], 1), "%)")
+
+p4 <- plot_scree(var_scaled, title = "Scree plot – Scaled (z-score)")
+
+p5 <- plot_pca(sc_scaled, colour_var = "cell_type", shape_var = "treatment",
+               title = "PCA – Scaled (colour = cell type)",
+               xlab = xlab_sc, ylab = ylab_sc)
+
+p6 <- plot_pca(sc_scaled, colour_var = "replicate", shape_var = "treatment",
+               title = "PCA – Scaled (colour = replicate / batch)",
+               xlab = xlab_sc, ylab = ylab_sc)
+
+grid.arrange(p4, p5, p6, layout_matrix = rbind(c(1,1), c(2,3)))
+
+```
+
+
+### 2.5 PCA on Normalized normalised data
+
+```{r pca_norm}
+pca_norm <- run_pca(counts_norm_raw, scale. = FALSE, center = TRUE)
+
+var_norm  <- pca_var_explained(pca_norm)
+sc_norm   <- pca_scores_df(pca_norm, metadata)
+
+xlab_norm <- paste0("PC1 (", round(var_norm$variance[1], 1), "%)")
+ylab_norm <- paste0("PC2 (", round(var_norm$variance[2], 1), "%)")
+
+p7 <- plot_scree(var_norm, title = "Scree plot – Normalized")
+
+p8 <- plot_pca(sc_norm, colour_var = "cell_type", shape_var = "treatment",
+               title = "PCA – Normalized (colour = cell type)",
+               xlab = xlab_norm, ylab = ylab_norm)
+
+p9 <- plot_pca(sc_norm, colour_var = "replicate", shape_var = "treatment",
+               title = "PCA – Normalized (colour = replicate / batch)",
+               xlab = xlab_norm, ylab = ylab_norm)
+
+grid.arrange(p7, p8, p9, layout_matrix = rbind(c(1,1), c(2,3)))
+```
+
+### 2.6 Variance explained – comparison table
+
+```{r var_table}
+var_compare <- data.frame(
+  PC          = 1:10,
+  Raw         = round(var_raw$variance[1:10], 2),
+  Scaled      = round(var_scaled$variance[1:10], 2),
+  Norm        = round(var_norm$variance[1:10], 2)
+)
+kable(var_compare,
+      caption = "% variance explained by PC1–10 under different preprocessing")
+```
+
+
+::: {style="background-color: #eceff1; color: #263238; padding: 15px; border-left: 6px solid #455a64; border-radius: 5px;"}
+1.  Raw PCA: When we applied PCA directly to the raw count matrix, we
+    immediately observed a severe structural bias: the first Principal
+    Component (PC1) captured an abnormally high 48.76% of the total
+    variance. In the context of transcriptomic data, such a high figure
+    is a clear red flag indicating that a single source of variation is
+    completely dominant. In our case, this source is the library size
+    (sequencing depth). Because some samples were sequenced deeper than
+    others, this principal component captures a purely technical
+    artifact, completely masking the true biological differences in gene
+    expression that we aim to study.
+
+2.  Scaled PCA (Z-score) To attempt to correct this technical bias, we
+    standardized the data using z-score scaling. However, the resulting
+    PCA showed a variance distribution that was far too uniform, with
+    PC1 dropping drastically to just 5.76%. While scaling forces every
+    gene to have a mean of zero and a variance of one, this approach
+    proved counterproductive for our dataset. By assigning exactly the
+    same mathematical weight to every single gene, we effectively
+    amplified the background noise. Genes with almost null
+    expression—where variations are purely stochastic and
+    uninformative—gained the same influence as highly expressed,
+    biologically relevant genes. This overwhelming wave of homogeneous
+    noise completely blurred the underlying structure of the data,
+    preventing any principal component from defining clear biological
+    clusters.
+
+3.  Normalized PCA Finally, when we applied a proper normalization
+    method, we obtained a much more balanced and coherent variance
+    distribution: PC1 accounted for 33.78% and PC2 for 14.95%. This
+    preprocessing step allowed us to successfully eliminate the bias
+    introduced by library size without suppressing the inherent
+    variability of highly expressed genes. By doing so, we managed to
+    clean up the technical artifacts while retaining and emphasizing the
+    true biological expression differences between the genes.
+
+4.  Compartison Raw vs Normalized Looking and the plots and their
+    interpretation showed to us the absolute necessity of normalization.
+    The Raw PCA is entirely hijacked by sequencing depth artifacts,
+    making it fundamentally flawed and practically useless for authentic
+    biological interpretation, as it reflects how the data was collected
+    rather than what the data actually means. Conversely, the Normalized
+    PCA strikes the essential balance: it effectively zeroes out the
+    technical noise of library size while fully preserving and
+    highlighting the critical biological variance. Therefore, we can
+    truly conclude that the normalized dimensional space is the only one
+    that provides a reliable, accurate representation of our samples'
+    true expression profiles, making it the definitive framework we will
+    utilize for all downstream biological analyses.
+:::
+
+### 2.7 Batch effect assessment
+
+```{r batch_effect}
+ggplot(sc_norm, aes(x = PC1, y = PC2,
+                    colour = replicate, shape = cell_type)) +
+  geom_point(size = 3, alpha = 0.85) +
+  facet_wrap(~treatment) +
+  labs(title = "PCA – Normalized: batch effect check",
+       subtitle = "Colour = replicate (batch), shape = cell type",
+       x = xlab_norm, y = ylab_norm) +
+  scale_colour_brewer(palette = "Set1") 
+
+```
+**Interpretation – Batch effects:**
+
+::: {style="background-color: #e8f5e9; color: #1b5e20; padding: 15px; border-left: 6px solid #2e7d32; border-radius: 5px;"}
+Biologically, the massive changes in gene expression and strong clustering we observe are overwhelmingly driven by the latency-reversing treatments (SAHA and especially PMA) compared to the DMSO control. It is crucial to note that uninfected Jurkat cells and J-LatA2 cells (which harbor latent HIV) share a nearly identical transcriptomic profile in their basal state. Therefore, the primary variance is not driven by cell type before stimulation, but by the massive transcriptional shock given by the drugs.
+
+The separation observed along PC2 represents technical noise—likely batch effects from minor differences in lab conditions, handling, or reagents on the specific day the replicates were processed. By identifying and eventually correcting this noise, we ensure that our downstream analysis only measures true biological changes, preventing false statistical results.
+:::
+
+::: {style="background-color: #eceff1; color: #263238; padding: 15px; border-left: 6px solid #455a64; border-radius: 5px;"}
+Visualizing the normalized data by replicate confirmed to us that it had a mild batch effect, samples from replicate 1 tend to cluster separately from replicates 2 and 3. However, the biological signal (treatment) remains the absolute dominant driver of variance. And based on the initial dataset quality control guidelines, no outliers require removal.
+:::
+
+### 2.8 PC1/PC2 correlation with metadata variables
+
+::: {style="background-color: #e8f5e9; color: #1b5e20; padding: 15px; border-left: 6px solid #2e7d32; border-radius: 5px;"}
+Here we did this Kruskal-Wallis test, because as we only have n=3
+replicates, we can't assume normality, making a non-parametric test like
+Kruskal-Wallis much safer than an ANOVA. Also the design is unbalanced,
+and Kruskal-Wallis handles unequal group sizes and variances better,
+avoiding potential false positives. It works for both 2 groups (cell
+type) and 3 groups (treatment), so we could use the same statistical
+test for every variable. This allowed us to wrap everything in a for
+loop, making the code much cleaner, more efficient, and easier to
+automate.
+:::
+
+```{r pc_correlation}
+covariables <- c("cell_type", "treatment", "replicate")
+
+pc_pvals <- data.frame(
+  PC1_p = sapply(covariables, function(x) kruskal.test(sc_norm$PC1 ~ as.factor(sc_norm[[x]]))$p.value),
+  PC2_p = sapply(covariables, function(x) kruskal.test(sc_norm$PC2 ~ as.factor(sc_norm[[x]]))$p.value)
+)
+
+print(round(pc_pvals, 4))
+```
+
+#### Alternatives {.tabset .tabset-pills}
+
+##### Method 1: Boxplots
+
+```{r pc_boxplots, fig.height=5}
+b1 <- ggplot(sc_norm, aes(x = cell_type, y = PC1, fill = cell_type)) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "PC1 by cell type", x = NULL) +
+  theme(legend.position = "none")
+
+b2 <- ggplot(sc_norm, aes(x = treatment, y = PC2, fill = treatment)) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "PC2 by treatment", x = NULL) +
+  theme(legend.position = "none")
+
+b3 <- ggplot(sc_norm, aes(x = replicate, y = PC1, fill = replicate)) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = "PC1 by replicate (batch)", x = NULL) +
+  theme(legend.position = "none")
+
+b4 <- ggplot(sc_norm, aes(x = replicate, y = PC2, fill = replicate)) +
+  geom_boxplot(outlier.size = 1) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = "PC2 by replicate (batch)", x = NULL) +
+  theme(legend.position = "none")
+
+grid.arrange(b1, b2, b3, b4, nrow = 2)
+```
+**Interpretation – Boxplot:**
+
+
+These boxplots visually confirm our statistical findings regarding the primary drivers of variance in our normalized dataset. We can clearly see that baseline cell type barely influences PC1, with J-LatA2 and Jurkat showing nearly identical and overlapping distributions. Conversely, the experimental treatments strongly drive the variance, distinctly separating the DMSO, PMA, and SAHA groups along PC2. Finally, the bottom panels isolate our technical batch effect: while replicates remain balanced across PC1, Replicate 1 shows a distinct upward shift along PC2, proving that this secondary axis captures a mixture of drug response and technical noise
+
+##### Method 2: Interactive bar graph
+
+```{r}
+metadata_numeric <- sc_norm %>%
+  mutate(
+    cell_type_num = as.numeric(factor(cell_type)),
+    treatment_num = as.numeric(factor(treatment)),
+    replicate_num = as.numeric(factor(replicate))
+  )
+
+cor_pc1 <- c(
+  Cell_Type = cor(metadata_numeric$PC1, metadata_numeric$cell_type_num),
+  Treatment = cor(metadata_numeric$PC1, metadata_numeric$treatment_num),
+  Replicate = cor(metadata_numeric$PC1, metadata_numeric$replicate_num)
+)
+
+cor_pc2 <- c(
+  Cell_Type = cor(metadata_numeric$PC2, metadata_numeric$cell_type_num),
+  Treatment = cor(metadata_numeric$PC2, metadata_numeric$treatment_num),
+  Replicate = cor(metadata_numeric$PC2, metadata_numeric$replicate_num)
+)
+
+cor_df <- data.frame(
+  PC = rep(c("PC1", "PC2"), each = 3),
+  Variable = rep(c("Cell Type", "Treatment", "Replicate"), 2),
+  Correlation = c(cor_pc1, cor_pc2)
+)
+
+plot_ly(cor_df, 
+        x = ~Variable, 
+        y = ~Correlation, 
+        color = ~PC,
+        colors = c("#E41A1C", "#377EB8"),
+        type = "bar",
+        text = ~paste("PC:", PC, "<br>Variable:", Variable, "<br>R =", round(Correlation, 3)),
+        hoverinfo = "text") %>%
+  layout(title = "Correlation Strength between PCs and Metadata Variables",
+         xaxis = list(title = "Metadata Variable"),
+         yaxis = list(title = "Correlation Coefficient (R)", range = c(-1, 1)),
+         barmode = "group",
+         annotations = list(
+           text = "Positive correlation = variable increases with PC | Negative = inverse relationship",
+           x = 0.5, y = -0.15, xref = "paper", yref = "paper",
+           showarrow = FALSE, font = list(size = 10)
+         ),
+         font = list(family = "Arial", size = 12, color = "#4A2323"),
+         title = list(font = list(color = "#800000", face = "bold")),
+         plot_bgcolor = "#FFFFFF",
+         paper_bgcolor = "#FCFBFB")
+```
+
+
+**Interpretation – PC correlation:**
+
+
+PCA reduces our thousands of measured genes into components that capture the main sources of variation. Looking at how metadata variables associate with these PCs, the Kruskal-Wallis test shows that cell type alone doesn't drive the global variance (p = 0.7633 for PC1; p = 0.9528 for PC2). This makes complete biological sense: J-LatA2 is simply a clonal derivative of Jurkat with a latent provirus. Before any drug is applied, their basal transcriptomes are virtually identical.
+
+Instead, the experimental treatment is the absolute main driver of the data's structure. It strongly correlates with both PC1 and PC2 (p = 0.0000 for both). This is clearly visible in the PCA plots: DMSO controls cluster tightly together, while the latency-reversing drugs (PMA and SAHA) push the expression profiles into completely different areas, confirming that the stimulation worked and fundamentally altered the cells' transcription.
+
+However, there’s a catch regarding the experimental replicates. While the replicate variable isn't quite significant on PC1 (p = 0.0770), it is a massive driver for the variance on PC2 (p = 0.0000). This confirms a clear batch effect, meaning technical factors—like daily variations in cell culture conditions, RNA extraction efficiency, or sequencing runs—influenced the data alongside the actual biology. Catching this was exactly why we used the Kruskal-Wallis test; with only n=3 per group, it allowed us to bypass the strict normality assumptions of an ANOVA and get reliable p-values.
+
+Because this batch effect takes up a huge chunk of the dataset's variance, we must address and correct it before moving on to differential expression analysis. If we just ignored it and compared only the treatments, the uncorrected batch variance on PC2 would artificially inflate the statistical model's noise. This would severely reduce our statistical power and increase the likelihood of missing truly differentially expressed genes.
+
+
+### 2.9 Biological interpretation of the loadings
+
+Here we can see what are the genes that drive the Principal Components
+the most
+
+```{r}
+loadings <- as.data.frame(pca_norm$rotation[, 1:2])
+colnames(loadings) <- c("PC1", "PC2")
+
+top_pc1 <- head(loadings[order(abs(loadings$PC1), decreasing=TRUE),], 10)
+top_pc2 <- head(loadings[order(abs(loadings$PC2), decreasing=TRUE),], 10)
+
+cat("Top genes driving PC1 (treatment axis):\n")
+print(rownames(top_pc1))
+
+cat("\nTop genes driving PC2 (batch/replicate axis):\n")  
+print(rownames(top_pc2))
+```
+
+# t-SNE
+
+## Question 3 – t-SNE Representation
+
+### 3.1 Helper function for t-SNE
+
+```{r tsne_function}
+
+run_tsne <- function(mat, perplexity = 30, max_iter = 1000,
+                     check_duplicates = FALSE, pca = TRUE, seed = 42) {
+  (seed)
+  Rtsne(as.matrix(mat),
+        perplexity       = perplexity,
+        max_iter         = max_iter,
+        check_duplicates = check_duplicates,
+        pca              = pca,
+        verbose          = FALSE)
+}
+
+plot_tsne <- function(tsne_obj, metadata, colour_var, shape_var = NULL,
+                      title = "t-SNE", palette = NULL) {
+  df <- data.frame(
+    tSNE1 = tsne_obj$Y[, 1],
+    tSNE2 = tsne_obj$Y[, 2],
+    metadata
+  )
+  p <- ggplot(df, aes_string(x = "tSNE1", y = "tSNE2",
+                              colour = colour_var,
+                              shape  = shape_var)) +
+    geom_point(size = 3, alpha = 0.85) +
+    labs(title = title, x = "t-SNE 1", y = "t-SNE 2") 
+  if (!is.null(palette)) p <- p + scale_colour_manual(values = palette)
+  p
+}
+```
+
+```{r tsne_raw, cache=TRUE, include=FALSE}
+tsne_raw <- run_tsne(counts_t, perplexity = 30)
+```
+
+```{r tsne_norm, cache=TRUE, include=FALSE}
+tsne_norm <- run_tsne(counts_norm_raw, perplexity = 30)
+```
+
+### 3.2 Comparison: raw vs. normalised t-SNE
+
+```{r tsne_comparison}
+df_raw  <- data.frame(tsne_raw$Y,  metadata, data = "Raw counts")
+df_norm <- data.frame(tsne_norm$Y, metadata, data = "Normalized")
+colnames(df_raw)[1:2] <- colnames(df_norm)[1:2] <- c("tSNE1","tSNE2")
+df_both <- rbind(df_raw, df_norm)
+
+ggplot(df_both, aes(x = tSNE1, y = tSNE2, colour = treatment, shape = cell_type)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  facet_wrap(~data, scales = "free") +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(title = "t-SNE comparison: raw vs. normalised") +
+  theme_hospital_bio()
+```
+
+
+**Interpretation – t-SNE:**
+
+::: {style="background-color: #eceff1; color: #263238; padding: 15px; border-left: 6px solid #455a64; border-radius: 5px;"}
+**RAW COUNTS t-SNE:** The raw counts embedding produces a strongly distorted projection. Instead of biologically meaningful clusters, samples arrange strictly by library size: high-depth samples are pushed to one region while low-depth samples cluster elsewhere. Coloring by replicate confirms this, as the three replicates form largely separate technical islands in the embedding space. Cell type and treatment signals overlap completely into useless noise. This perfectly illustrates the consequence of applying t-SNE to unnormalized RNA-seq counts: a single technical variable (sequencing depth) has variance orders of magnitude larger than any true biological effect.
+:::
+
+::: {style="background-color: #eceff1; color: #263238; padding: 15px; border-left: 6px solid #455a64; border-radius: 5px;"}
+**NORMALIZED t-SNE:** After total-expression normalization, the embedding reorganizes entirely around biology:
+
+* **Treatment macro-clusters:** The data clearly groups into distinct islands driven by the drugs. PMA forms the tightest and most distant cluster—consistent with PMA being a strong PKC activator that triggers massive global transcriptional reactivation of HIV and immune pathways. SAHA and the DMSO vehicle control occupy adjacent but separable sub-clusters, reflecting the more modest transcriptional effect of the HDAC inhibitor compared to PMA.
+* **Cell type sub-clustering:** Inside each of these main treatment islands, the algorithm cleanly separates the Jurkat (HIV-negative) from the J-LatA2 (latent HIV) cells. 
+* **Batch effect:** Replicate noise is visible as intra-cluster dispersion, but it does not dominate over the biological structure. Samples from the same condition across different replicates still co-localize within the same sub-cluster, confirming that biology > batch after normalization.
+
+**KEY DIFFERENCE FROM PCA:** t-SNE reveals the sub-cluster structure much more clearly than PCA because it preserves local neighborhood distances. While PCA compresses the treatment sub-groups into a single axis (PC2), losing the internal geometry, t-SNE cleanly unpacks them. However, it is important to remember that t-SNE distances *between* the macro-clusters are not directly interpretable as they are in PCA; only cluster membership and compactness carry meaning.
+:::
+
+### 3.3 Correlation between t-SNE coordinates and gene expression
+
+We test whether the t-SNE axes correlate with the expression of the
+top-loading genes identified in the PCA (biologically interpretable
+proxies). Spearman correlation is used: t-SNE coordinates are not
+normally distributed and the relationship with expression need not be
+linear.
+
+```{r tsne_expression_cor, message=FALSE, warning=FALSE}
+tsne_coords <- data.frame(
+  tSNE1 = tsne_norm$Y[, 1],
+  tSNE2 = tsne_norm$Y[, 2]
+)
+
+top_genes <- rownames(top_pc1)[1:10]
+
+cor_tbl <- data.frame(
+  Gene      = top_genes,
+  rho_tSNE1 = sapply(top_genes, function(g)
+    cor(tsne_coords$tSNE1, counts_norm_raw[, g], method = "spearman")),
+  rho_tSNE2 = sapply(top_genes, function(g)
+    cor(tsne_coords$tSNE2, counts_norm_raw[, g], method = "spearman")),
+  p_tSNE1   = sapply(top_genes, function(g)
+    cor.test(tsne_coords$tSNE1, counts_norm_raw[, g],
+             method = "spearman", exact = FALSE)$p.value),
+  p_tSNE2   = sapply(top_genes, function(g)
+    cor.test(tsne_coords$tSNE2, counts_norm_raw[, g],
+             method = "spearman", exact = FALSE)$p.value)
+)
+
+kable(round(cor_tbl[, -1], 4),
+      row.names = TRUE,
+      caption = "Spearman correlation: tSNE coordinates vs top-PC1 gene expression")
+
+top1_gene  <- top_genes[1]  
+expr_top1  <- counts_norm_raw[, top1_gene]
+
+tsne_coords$expr      <- expr_top1
+tsne_coords$group     <- metadata$group
+tsne_coords$replicate <- metadata$replicate
+
+ggplot(tsne_coords, aes(x = tSNE1, y = tSNE2, colour = expr)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  scale_colour_viridis_c(option = "magma", name = "Norm. expr.") +
+  labs(
+    title    = paste("t-SNE coloured by expression:", top1_gene),
+    subtitle = paste0("Spearman ρ with tSNE1 = ",
+                      round(cor_tbl$rho_tSNE1[1], 3),
+                      " (p=", formatC(cor_tbl$p_tSNE1[1], format="e", digits=2), ")"),
+    x = "t-SNE 1", y = "t-SNE 2"
+  )
+```
+
+::: {style="background-color: #eceff1; color: #263238; padding: 15px; border-left: 6px solid #455a64; border-radius: 5px;"}
+
+Genes with the highest PC1 loadings also show strong Spearman
+correlation with tSNE1 (\|ρ\| \> 0.5 for the top gene). This is
+expected: both PC1 and tSNE1 capture the dominant source of biological
+variation (treatment / cell-type). However, the correlation with tSNE2
+is weaker and variable across genes, reflecting that t-SNE2 encodes
+local neighborhood geometry that does not map cleanly onto a single
+linear gene-expression gradient. This confirms that PCA loadings are the
+appropriate tool for identifying "driver genes", while t-SNE is better
+used for visual quality control of sample grouping.
+:::
+
+## Question 4 – t-SNE Parameters
+
+All parameter explorations use the **Normalized** normalised matrix
+only.
+
+### Parameters {.tabset .tabset-pills}
+
+As we have seen, t-SNE is incredibly sensitive to both its initial
+random state and its internal hyperparameters. If we simply run the
+algorithm blindly without exploring and understanding these settings,
+our visualization becomes a moving target. Without this control, critics
+could easily dismiss the separation between Jurkat and J-LatA2 cells as
+a mere visual artifact rather than a true biological phenomenon.
+Exploring these parameters proves that the clustering we observe is
+mathematically stable.
+
+Therefore, to guarantee that a specific plot looks completely identical
+every time the computational environment must be strictly controlled.
+After investiganing we saw that this requires locking in three key
+variables:
+
+1.  The Random Seed: Forcing the algorithm to use the exact same
+    starting positions (e.g., set.seed(42)).
+
+2.  Perplexity: Keeping the balance between local and global data
+    structures consistent (e.g., exactly 30).
+
+3.  Iterations: Running the optimization for the same number of steps
+    (e.g., 1000) to ensure it reaches the exact same state of
+    convergence."
+
+#### 4.1 Reproducibility
+
+::: {style="background-color: #eaf2f8; color: #21618c; padding: 15px; border-left: 4px solid #3498db; border-radius: 4px; margin-bottom: 15px;"}
+**Reproducibility:** because t-SNE is an inherently stochastic algorithm, it begins by assigning random coordinates to every sample, meaning the visual map changes every time it runs. To prove that our biological clusters are real and not just algorithmic chance, we must actively enforce mathematical reproducibility. By explicitly setting a random seed, we lock these initial starting positions in place, guaranteeing that our exact results can be perfectly replicated for publication or peer review.
+:::
+
+```{r tsne_reproducibility, cache=TRUE,include=TRUE, fig.height=9}
+
+cell_shapes <- c("Jurkat" = 17, "J-LatA2" = 16)
+
+seeds <- c(1, 42, 123, 999)
+
+tsne_seed_list <- lapply(seeds, function(s) {
+  set.seed(s)
+  Rtsne(as.matrix(counts_norm_raw), perplexity = 30, max_iter = 1000,
+        check_duplicates = FALSE, pca = TRUE, verbose = FALSE)
+})
+
+plots_seeds <- lapply(seq_along(seeds), function(i) {
+  df <- data.frame(tSNE1 = tsne_seed_list[[i]]$Y[,1],
+                   tSNE2 = tsne_seed_list[[i]]$Y[,2],
+                   treatment = metadata$treatment,
+                   cell_type = metadata$cell_type)
+  ggplot(df, aes(x = tSNE1, y = tSNE2, colour = treatment, shape = cell_type)) +
+    geom_point(size = 2.5, alpha = 0.8) +
+    scale_colour_manual(values = treatment_colours) +
+    scale_shape_manual(values = cell_shapes) +
+    labs(title = paste("Seed =", seeds[i])) +
+    theme(legend.position = "none")
+})
+
+legend_df <- expand.grid(
+  treatment = c("DMSO", "SAHA", "PMA"),
+  cell_type = c("Jurkat", "J-LatA2")
+)
+legend_df$tSNE1 <- NA
+legend_df$tSNE2 <- NA
+
+legend_p <- ggplot(legend_df, aes(x = tSNE1, y = tSNE2, colour = treatment, shape = cell_type)) +
+  geom_point(size = 4, na.rm = TRUE) +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  theme_void() +
+  theme(legend.position = "right",
+        legend.box = "vertical",
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(size = 10))
+
+library(cowplot)
+legend_only <- get_legend(legend_p)
+
+grid.arrange(
+  arrangeGrob(grobs = plots_seeds, ncol = 2),
+  legend_only,
+  ncol = 2,
+  widths = c(4, 0.6),
+  top = grid::textGrob("t-SNE reproducibility: different random seeds (perplexity=30)", 
+                       gp = grid::gpar(fontface = "bold", fontsize = 14))
+)
+```
+
+
+**Comment:** Because t-SNE assigns initial coordinates completely at
+random, the overall orientation of the map shifts dramatically depending
+on the seed. You can clearly see the macro-clusters rotating and
+flipping across the four panels. For example, the orange SAHA cluster is
+located in the top-left for Seed 1, but completely relocates to the
+bottom-right for Seed 42. This visually proves that the absolute X and Y
+axes (tSNE1 and tSNE2) have no fixed mathematical meaning.
+
+Despite the global map spinning and flipping, the local relationships
+between the samples remain perfectly conserved across every single run.
+The algorithm consistently identifies the exact same biological
+signatures:
+
+The samples always separate into three highly distinct macro-clusters
+driven by the Treatment (DMSO in blue, SAHA in orange, and PMA in
+red).
+
+Within each of those treatment islands, the algorithm consistently
+maintains a clear boundary between the Cell Types, cleanly dividing the
+Jurkat cells (triangles) from the J-LatA2 cells (circles).
+
+This grid definitively proves that t-SNE is a reliable tool for
+discovering true biological groupings, as the clusters are not just
+random chance. However, it also highlights why setting a random seed
+(e.g., set.seed(42)) is an absolute requirement. Without locking the
+seed, the layout will shift every time the script is run, making it
+impossible to standardize a final plot for the presentation.
+
+
+#### 4.2 Perplexity
+
+::: {style="background-color: #eaf2f8; color: #21618c; padding: 15px; border-left: 4px solid #3498db; border-radius: 4px; margin-bottom: 15px;"}
+**Perplexity** acts as a mathematical tuning knob that dictates how many local neighbors each data point considers when forming relationships, effectively balancing the algorithm's attention between local and global data structures. If this value is set too low, the algorithm overreacts to minor local variations, fracturing our data into tiny, noisy, and biologically meaningless islands. Conversely, an appropriately scaled perplexity allows the algorithm to recognize broader patterns, binding the samples into solid, visually coherent clusters that actually reflect the underlying biology.
+:::
+
+```{r tsne_perplexity_static, cache=TRUE, fig.height=9, include=TRUE}
+# Calculate t-SNE for different perplexities
+perplexities <- c(5, 10, 15, 20, 30, 50, 80)
+n_samples <- nrow(counts_norm_raw)
+max_perp <- floor((n_samples - 1) / 3)
+perplexities <- perplexities[perplexities < max_perp]
+
+tsne_perp_list <- lapply(perplexities, function(p) {
+  set.seed(42)
+  Rtsne(as.matrix(counts_norm_raw), perplexity = p, max_iter = 1000,
+        check_duplicates = FALSE, pca = TRUE, verbose = FALSE)
+})
+
+df_perp_animated <- do.call(rbind, lapply(seq_along(perplexities), function(i) {
+  data.frame(
+    tSNE1 = tsne_perp_list[[i]]$Y[,1],
+    tSNE2 = tsne_perp_list[[i]]$Y[,2],
+    treatment = metadata$treatment,
+    cell_type = metadata$cell_type,
+    perplexity = factor(perplexities[i], levels = perplexities)
+  )
+}))
+
+p_perp <- plot_ly(df_perp_animated, 
+                  x = ~tSNE1, y = ~tSNE2, 
+                  color = ~treatment, 
+                  colors = treatment_colours,
+                  symbol = ~cell_type, 
+                  symbols = c("circle", "triangle-up"),
+                  frame = ~perplexity,
+                  text = ~paste("Perplexity:", perplexity, "<br>Treatment:", treatment, "<br>Cell type:", cell_type),
+                  hoverinfo = "text",
+                  type = 'scatter',
+                  mode = 'markers',
+                  marker = list(size = 10)) %>%
+  layout(title = "t-SNE: Effect of Perplexity (use slider to animate)",
+         xaxis = list(title = "t-SNE 1"),
+         yaxis = list(title = "t-SNE 2"),
+         font = list(family = "Arial", size = 12, color = "#4A2323"),
+         title = list(font = list(color = "#800000", face = "bold")),
+         plot_bgcolor = "#FFFFFF",
+         paper_bgcolor = "#FCFBFB",
+         annotations = list(
+           text = "Higher perplexity = more global structure | Colors: DMSO, SAHA, PMA | Shapes: ● Jurkat ▲ J-LatA2",
+           x = 0.5, y = -0.12, xref = "paper", yref = "paper",
+           showarrow = FALSE, font = list(size = 11)
+         )) %>%
+  animation_opts(frame = 1000, transition = 500, redraw = TRUE) %>%
+  animation_button(x = 1, xanchor = "right", y = 0, yanchor = "bottom")
+
+p_perp
+```
+::: {style="background-color: #eaf2f8; color: #21618c; padding: 15px; border-left: 4px solid #3498db; border-radius: 4px; margin-bottom: 15px;"}
+
+Low Perplexity (p = 10 to 15): At lower values, the algorithm is overly
+sensitive to local, nearest-neighbor distances. The resulting projection
+is sprawling and slightly fragmented. While the three main treatment
+groups (PMA, SAHA, DMSO) separate, the points within them are loosely
+scattered, making the boundaries between the Jurkat and J-LatA2
+sub-clusters harder to define with confidence.
+
+Moderate Perplexity (p = 20 to 30): This is the best for our data set.
+The algorithm successfully balances local clustering with global
+awareness. At perplexity = 30, we achieve optimal biological resolution:
+the three treatment groups form tight, distinct macro-clusters, and
+within each one, the cell types (Jurkat triangles vs. J-LatA2 circles)
+separate cleanly without artificial fragmentation.
+
+High Perplexity (p = 50): As the perplexity approaches the theoretical
+maximum for a dataset of this size, the algorithm considers too many
+global neighbors. The projection becomes overly rigid and
+over-compressed. The distinct treatment islands lose their spatial
+independence and are pulled tightly together into a dense column in the
+center of the map, collapsing the nuanced local geometry.
+
+This visual progression confirms that a perplexity of 30 is the optimal
+setting for this specific dataset. It avoids the fragmentation of lower
+values and the artificial compression of higher values, providing the
+most accurate and readable representation of the true biological
+variance.
+::: 
+
+**Perplexity limits**
+
+```{r perplexity_limits}
+cat("Dataset: n =", nrow(counts_norm_raw), "samples\n")
+cat("Maximum theoretically valid perplexity: <", max_perp, "\n\n")
+
+perp_test <- c(2, 5, 10, 20, 30, 50, 80)
+valid <- perp_test[perp_test < max_perp]
+cat("Valid perplexity values tested:", paste(valid, collapse=", "), "\n")
+```
+
+The theoretical maximum perplexity is strictly dictated by the dataset's
+size. For a dataset of 271 samples, the absolute upper limit for
+perplexity is 90 (calculated mathematically as (N-1)/3). Attempting to
+run the algorithm with a perplexity equal to or greater than this
+threshold will cause a computational error. Therefore, our selected test
+range—from 2 up to 80—safely covers the entire valid parameter space,
+allowing us to evaluate both local and global extremes without breaking
+the algorithm's mathematical boundaries.
+
+#### 4.3 Iterations
+
+::: {style="background-color: #eaf2f8; color: #21618c; padding: 15px; border-left: 4px solid #3498db; border-radius: 4px; margin-bottom: 15px;"}
+**Iterations** dictate how many steps the algorithm is allowed to take to nudge the data points from their initial random scatter into their final, organized clusters. When we set the iterations too low (e.g., under 250), the algorithm simply ran out of time before reaching convergence, leaving us with a diffuse, unresolved cloud where the boundaries between the Jurkat and J-LatA2 cells are artificially blurred. For this dataset, the cluster topology stabilizes and locks into place between 500 and 1000 iterations. Pushing it further (e.g., 2000 iterations) offers heavily diminishing returns, wasting computational power without adding any new biological clarity to the final map.
+:::
+
+```{r tsne_iterations_static, cache=TRUE, fig.height=9, include=TRUE}
+iterations <- c(50, 100, 250, 500, 750, 1000, 1500, 2000)
+
+tsne_iter_list <- lapply(iterations, function(it) {
+  set.seed(42)
+  Rtsne(as.matrix(counts_norm_raw), perplexity = 30, max_iter = it,
+        check_duplicates = FALSE, pca = TRUE, verbose = FALSE)
+})
+
+df_iter_animated <- do.call(rbind, lapply(seq_along(iterations), function(i) {
+  data.frame(
+    tSNE1 = tsne_iter_list[[i]]$Y[,1],
+    tSNE2 = tsne_iter_list[[i]]$Y[,2],
+    treatment = metadata$treatment,
+    cell_type = metadata$cell_type,
+    iteration = factor(iterations[i], levels = iterations)
+  )
+}))
+
+p_iter <- plot_ly(df_iter_animated, 
+                  x = ~tSNE1, y = ~tSNE2, 
+                  color = ~treatment, 
+                  colors = treatment_colours,
+                  symbol = ~cell_type, 
+                  symbols = c("circle", "triangle-up"),
+                  frame = ~iteration,
+                  text = ~paste("Iteration:", iteration, "<br>Treatment:", treatment, "<br>Cell type:", cell_type),
+                  hoverinfo = "text",
+                  type = 'scatter',
+                  mode = 'markers',
+                  marker = list(size = 10)) %>%
+  layout(title = "t-SNE Convergence: Effect of Iterations (use slider to animate)",
+         xaxis = list(title = "t-SNE 1"),
+         yaxis = list(title = "t-SNE 2"),
+         font = list(family = "Arial", size = 12, color = "#4A2323"),
+         title = list(font = list(color = "#800000", face = "bold")),
+         plot_bgcolor = "#FFFFFF",
+         paper_bgcolor = "#FCFBFB",
+         annotations = list(
+           text = "Convergence stabilizes around 1000 iterations | Colors: DMSO, SAHA, PMA | Shapes: ● Jurkat ▲ J-LatA2",
+           x = 0.5, y = -0.12, xref = "paper", yref = "paper",
+           showarrow = FALSE, font = list(size = 11)
+         )) %>%
+  animation_opts(frame = 800, transition = 400, redraw = TRUE) %>%
+  animation_button(x = 1, xanchor = "right", y = 0, yanchor = "bottom")
+
+p_iter
+```
+::: {style="background-color: #eaf2f8; color: #21618c; padding: 15px; border-left: 4px solid #3498db; border-radius: 4px; margin-bottom: 15px;"}
+
+When we set the iterations too low (e.g., under 250), the algorithm
+simply ran out of time before reaching convergence, leaving us with a
+diffuse, unresolved cloud where the boundaries between the Jurkat and
+J-LatA2 cells are artificially blurred.
+
+For this dataset, the cluster topology stabilizes and locks into place
+between 500 and 1000 iterations. Pushing it further (e.g., 2000
+iterations) offers heavily diminishing returns, wasting computational
+power without adding any new biological clarity to the final map.
+
+We found our sweet-spot in the 1000 iterations.
+:::
+
+### 4.4 Chosen final parameters and justification
+
+**Final t-SNE parameter choice:**
+
+* `perplexity = 30`
+
+* `max_iter   = 1000`
+
+* `pca        = TRUE` (pre-reduce to 50 PCs before t-SNE)
+
+* `seed       = 42`
+
+
+**Justification:**
+
+* **`perplexity = 30`**: Chosen because it lies in the optimal range for our dataset size (n=271). The rule of thumb is perplexity ≈ sqrt(n) ≈ 16, but empirically 20–50 performs better for RNA-seq. At `perplexity=5` we observed fragmented micro-clusters driven by noise; at `perplexity=80` sub-clusters collapsed. `perplexity=30` maximizes visual separation of the six biological groups while keeping replicates co-localized.
+
+* **`max_iter = 1000`**: Our iteration analysis shows the embedding converges visually between 500–1000 iterations. We use 1000 as a safe default with no computational penalty at this sample size. Beyond 1000, cluster topology is unchanged.
+
+* **`pca = TRUE`**: Rtsne internally reduces the 22,798-gene space to 50 PCs before computing pairwise distances. This is strongly recommended: (1) speeds up computation, (2) smooths out noisy low-variance genes that would inflate distances randomly, and (3) is consistent with standard RNA-seq t-SNE practice.
+
+* **`seed = 42`**: t-SNE is stochastic (random initialization). Fixing the seed ensures reproducibility. The cluster topology is robust to seed choice — the seed only affects rotation/reflection.
+
+
+**Important Note on Distance Interpretation:** It is fundamental to note that t-SNE preserves local neighborhood structure but **does not preserve global distances**. Therefore, distances between distinct macro-clusters in the resulting plots are not strictly interpretable, whereas the compactness within a specific cluster is biologically meaningful.
+
+# t-SNE vs PCA
+
+## Question 5 – Final Interpretation of t-SNE vs PCA
+
+## 5.1 Final PCA – polished plot
+
+```{r final_pca}
+ggplot(sc_norm, aes(x = PC1, y = PC2, colour = treatment, shape = cell_type)) +
+  geom_point(size = 3.5, alpha = 0.85) +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(
+    title = "Final PCA - HIV dataset (Normalized)",
+    subtitle = paste0(xlab_norm, " | ", ylab_norm),
+    x = xlab_norm, y = ylab_norm
+  ) +
+  theme_hospital_bio() +
+  theme(legend.position = "right", plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"))
+
+ggsave("PCA_Final.png", width = 16, height = 12, dpi = 300)
+```
+
+## 5.2 Final t-SNE – polished plot
+
+```{r final_tsne}
+df_tsne_final <- data.frame(
+  tSNE1 = tsne_norm$Y[, 1],
+  tSNE2 = tsne_norm$Y[, 2],
+  metadata
+)
+
+ggplot(df_tsne_final, aes(x = tSNE1, y = tSNE2, colour = treatment, shape = cell_type)) +
+  geom_point(size = 3.5, alpha = 0.85) +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(
+    title = "Final t-SNE - HIV dataset (Normalized, perplexity=30, iter=1000)",
+    x = "t-SNE 1", y = "t-SNE 2"
+  ) +
+  theme_hospital_bio() +
+  theme(legend.position = "right", plot.title = element_text(face = "bold"))
+
+ggsave("tsne_Final.png", width = 16, height = 12, dpi = 300)
+```
+
+## 5.3 PC1 and PC2 biological interpretation
+
+```{r loadings, results='hide', echo=FALSE}
+loadings <- as.data.frame(pca_norm$rotation[, 1:2])
+colnames(loadings) <- c("PC1", "PC2")
+
+top_pc1 <- loadings[order(abs(loadings$PC1), decreasing = TRUE), ][1:15,]
+top_pc2 <- loadings[order(abs(loadings$PC2), decreasing = TRUE), ][1:15,]
+
+kable(top_pc1, caption = "Top 15 genes contributing to PC1", digits = 5)
+kable(top_pc2, caption = "Top 15 genes contributing to PC2", digits = 5)
+```
+
+```{r loading_plots, fig.height=5}
+l1 <- ggplot(top_pc1, aes(x = reorder(rownames(top_pc1), abs(PC1)),
+                           y = PC1, fill = PC1 > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("red","blue"), guide = "none") +
+  labs(title = "Top gene loadings – PC1", x = "Gene", y = "Loading")
+
+l2 <- ggplot(top_pc2, aes(x = reorder(rownames(top_pc2), abs(PC2)),
+                           y = PC2, fill = PC2 > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("red","blue"), guide = "none") +
+  labs(title = "Top gene loadings – PC2", x = "Gene", y = "Loading")
+
+grid.arrange(l1, l2, ncol = 2)
+```
+
+## 5.4 Side-by-side final comparison
+
+```{r side_by_side, fig.height=8, fig.width=12}
+pca_final <- ggplot(sc_norm, aes(x = PC1, y = PC2, colour = treatment, shape = cell_type)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(title = "PCA (Normalized)", x = xlab_norm, y = ylab_norm) +
+  theme_hospital_bio()
+
+tsne_final <- ggplot(df_tsne_final, aes(x = tSNE1, y = tSNE2, colour = treatment, shape = cell_type)) +
+  geom_point(size = 3, alpha = 0.85) +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(title = "t-SNE (Normalized, perplexity=30)", x = "t-SNE 1", y = "t-SNE 2") +
+  theme_hospital_bio()
+
+grid.arrange(pca_final, tsne_final, ncol = 2)
+```
+
+**Do PCA and t-SNE lead to the same conclusions?**
+
+```{r methods_comparison}
+comparison <- data.frame(
+  Aspect = c("Primary separation", 
+             "Secondary separation", 
+             "Batch effect visible?", 
+             "Outliers detected?", 
+             "Interpretability"),
+  PCA = c("Cell type (Jurkat vs J-LatA2) on PC1", 
+          "Treatment (PMA most distinct) on PC2", 
+          "Yes, replicates overlap partially", 
+          "No", 
+          "PCs have defined meaning (% variance)"),
+  t_SNE = c("Cell type in distinct clusters", 
+            "Treatment sub-clusters within each cell line", 
+            "Yes, same pattern", 
+            "No", 
+            "Axes are arbitrary; cluster shape meaningful")
+)
+kable(comparison, caption = "Table 2: PCA vs t-SNE Conclusions")
+```
+::: {style="background-color: #eaf2f8; color: #21618c; padding: 15px; border-left: 4px solid #3498db; border-radius: 4px; margin-bottom: 15px;"}
+
+**Both methods agree on the key biological findings**: When comparing both dimensionality reduction techniques, we find that PCA and t-SNE lead to fundamentally aligned conclusions regarding our core biological findings, while offering complementary perspectives on the data.
+
+1. That the treatment is the dominant source of variation. The experimental treatment emerges as the primary driving force of transcriptomic variance. In PCA, the major displacement is dictated by the drugs applied, separating the heavily reactivated PMA samples from SAHA and the DMSO vehicle controls. Similarly, t-SNE organizes the data into distinct macro-clusters based almost entirely on the treatment received. This aligns with our Kruskal-Wallis statistical correlations, which confirmed treatment as the massive driver of both principal components.
+
+3. That the cell type drive secondary variation Within the primary treatment groupings, the intrinsic differences between Jurkat (HIV-negative) and J-LatA2 (latent HIV) cells dictate the next layer of variance. This is best visualized in t-SNE, where distinct sub-clusters form for each cell line strictly within the larger treatment islands, reflecting their differing HIV integration statuses and baseline transcriptomes once the drug effect is accounted for.
+
+4. We saw that a mild batch effect is present, our visual inspection of both projections reveals that samples from the exact same condition, but across different replicates, do not completely overlap. Because this technical variation is visible, we must correct for it (e.g., using tools like ComBat or limma's removeBatchEffect) prior to running our differential expression analysis to ensure statistical robustness.
+
+5. We found no outliers present. Reassuringly, we did not detect any aberrant sample outliers in either the PCA or t-SNE spaces, which is consistent with the initial quality control metrics and the dataset's description.
+
+6. We understood that the methods are complementary, not redundant, while PCA provides us with a linear, highly interpretable global map where the axes hold defined meaning (percentage of variance explained), t-SNE gives us enhanced local resolution. t-SNE excels at unpacking and separating the finer sub-groups that PCA tends to compress, allowing us to visually confirm the tighter biological relationships within specific treatment clusters.
+:::
+
+The Critical Role of Normalization:
+Finally, our comparative analysis strongly underscores that rigorous data normalization is an absolute prerequisite for meaningful dimensionality reduction. If we were to project raw read counts into PCA or t-SNE spaces, the resulting plots would be entirely dominated by technical noise—specifically, sequencing depth and library-size artifacts. By applying robust normalization methods, we effectively strip away these technical confounding factors, ensuring that the true underlying biological structure—driven primarily by drug response and secondarily by cell type—is accurately unmasked and ready for interpretation.
+
+
+# UMAP
+
+I encourage you to show what you know and interpret what you see in a
+plot using the theory we learned. Provide different visualization and/or
+code alternatives.
+
+## UMAP helper functions
+
+```{r Helpers UMAP}
+
+run_umap <- function(mat, n_neighbors = 15, min_dist = 0.1, metric = "euclidean", seed = 42) {
+  library(umap)
+  set.seed(seed)
+  
+  custom_config <- umap.defaults
+  custom_config$n_neighbors <- n_neighbors
+  custom_config$min_dist <- min_dist
+  custom_config$metric <- metric
+  
+  umap::umap(as.matrix(mat), config = custom_config)
+}
+
+plot_umap <- function(umap_obj, metadata, colour_var, shape_var = NULL,
+                      title = "UMAP", palette = NULL) {
+  df <- data.frame(
+    UMAP1 = umap_obj$layout[, 1],
+    UMAP2 = umap_obj$layout[, 2],
+    metadata
+  )
+  
+  p <- ggplot(df, aes_string(x = "UMAP1", y = "UMAP2",
+                              colour = colour_var,
+                              shape  = shape_var)) +
+    geom_point(size = 3, alpha = 0.85) +
+    labs(title = title, x = "UMAP Dimension 1", y = "UMAP Dimension 2")
+
+  if (!is.null(palette)) {
+    p <- p + scale_colour_manual(values = palette)
+  }
+  
+  return(p)
+}
+```
+
+## QUESTION 6 - UMAP interpretation
+
+Create a UMAP visualization of the results. Explore differences between
+producing results from raw data counts or normalized results. Remove
+outlier and interpret the effects of it, if any outliers.
+
+```{r UMAP_data_prep_raw, cache=TRUE}
+set.seed(42)
+umap_raw <- umap::umap(counts_clean)
+
+umap_coords_raw <- as.data.frame(umap_raw$layout)
+colnames(umap_coords_raw) <- c("UMAP1", "UMAP2")
+
+umap_coords_raw$cell_type <- metadata[rownames(umap_coords_raw), "cell_type"]
+umap_coords_raw$treatment <- metadata[rownames(umap_coords_raw), "treatment"]
+umap_coords_raw$replicate <- metadata[rownames(umap_coords_raw), "replicate"]
+umap_coords_raw$group     <- metadata[rownames(umap_coords_raw), "group"]
+
+```
+
+```{r UMAP_data_prep_norm, cache=TRUE}
+
+umap_norm <- umap::umap(counts_norm_raw)
+
+umap_coords_norm <- as.data.frame(umap_norm$layout)
+colnames(umap_coords_norm) <- c("UMAP1", "UMAP2")
+
+umap_coords_norm$cell_type <- metadata[rownames(umap_coords_norm), "cell_type"]
+umap_coords_norm$treatment <- metadata[rownames(umap_coords_norm), "treatment"]
+umap_coords_norm$replicate <- metadata[rownames(umap_coords_norm), "replicate"]
+umap_coords_norm$group     <- metadata[rownames(umap_coords_norm), "group"]
+```
+
+### 6.1 UMAP data plots
+
+### Alternatives {.tabset .tabset-pills}
+
+#### Raw alternative 1
+
+```{r UMAP Visualization raw alternative 1}
+ggplot(umap_coords_raw, aes(x = UMAP1, y = UMAP2)) +
+  geom_point(aes(color = treatment, shape = cell_type), size = 2.5, alpha = 0.8) +
+  scale_color_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(
+    title = "UMAP - Raw Expression Counts",
+    subtitle = "Uncorrected technical library-size and depth variance",
+    x = "UMAP Dimension 1", y = "UMAP Dimension 2"
+  ) +
+  theme_hospital_bio()
+```
+
+1. UMAP Projection: The Raw Data:
+When we analyze our first UMAP projection using the raw expression counts, we immediately observe a glaring batch effect where technical noise entirely dominates the structure. Instead of clustering cohesively by our experimental treatments, the samples are randomly scattered across the space. The true underlying biology is completely masked by the severe differences in sequencing depth across our samples.
+
+
+#### Raw alternative 2
+
+```{r umap_alt_raw 2}
+ggplot(umap_coords_raw, aes(x = UMAP1, y = UMAP2)) +
+  geom_point(aes(color = treatment, shape = cell_type), size = 3, alpha = 0.8) +
+  facet_wrap(~replicate) + 
+  scale_color_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(
+    title = "UMAP Projection - Raw Expression Counts",
+    subtitle = "Faceted by experimental replicate to evaluate raw batch effects",
+    x = "UMAP Dimension 1", y = "UMAP Dimension 2"
+  ) +
+  theme_hospital_bio() +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+2. UMAP Projection: Faceted by Replicate:
+By separating these same raw data into individual panels based on the experimental replicate, we explicitly confirm the exact source of this fragmentation. We can clearly see how cells belonging to the exact same biological treatment—such as the red PMA samples—form completely isolated islands simply because they were processed in different batches. This perfectly illustrates why performing downstream analyses directly on unnormalized matrices is mathematically unviable.
+
+#### Normalized alternative 1
+
+```{r umap_alt_clean 1}
+ggplot(umap_coords_norm, aes(x = UMAP1, y = UMAP2)) +
+  geom_point(aes(color = treatment, shape = cell_type), size = 3.5, alpha = 0.85) +
+  scale_color_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(
+    title = "UMAP Projection - Total Expression Normalized Data",
+    subtitle = "Biological clustering after removing library-size technical bias",
+    x = "UMAP Dimension 1", y = "UMAP Dimension 2"
+  ) +
+  theme_hospital_bio() +
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+```
+
+3. UMAP Projection: The Normalized Data:
+After applying our total expression normalization, the UMAP topology changes drastically as we successfully eliminate the technical bias. This crucial correction allows the samples to overcome their batch origins and group perfectly according to the experimental treatment received. Furthermore, looking inside each macro-cluster, we can clearly appreciate a secondary sub-separation dictated by the cell line, with Jurkat and J-LatA2 cells forming their own dense, distinct sub-groups.
+
+
+#### Normalized alternative 2
+
+```{r umap_alt_clean 2}
+ggplot(umap_coords_norm, aes(x = UMAP1, y = UMAP2, color = treatment)) +
+  geom_point(aes(shape = cell_type), size = 3, alpha = 0.85) +
+  stat_ellipse(aes(fill = treatment), geom = "polygon", alpha = 0.1, level = 0.95) +
+  scale_color_manual(values = treatment_colours, name = "Treatment") +
+  scale_fill_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(
+    title = "UMAP Cluster Coherence - Normalized Data",
+    subtitle = "95% confidence intervals showing tight treatment grouping",
+    x = "UMAP Dimension 1", y = "UMAP Dimension 2"
+  ) +
+  theme_hospital_bio() +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+4. UMAP Projection: Confidence Ellipses:
+In our final plot, we added 95% confidence ellipses to strictly evaluate the statistical cohesion of our newly normalized data. This representation graphically demonstrates the tight robustness of our three distinct macro-groupings: the SAHA-treated samples in the top right (orange), the heavily reactivated PMA-treated samples in the bottom right (red), and our baseline DMSO controls isolated in the bottom left (blue).
+
+
+### 6.2 Difference analysis
+
+This visual progression provides irrefutable proof that our normalization process was both highly successful and absolutely mandatory for this dataset. By effectively filtering out technical noise and sequencing depth biases, we successfully recovered the true biological signal of our experiment. Ultimately, we can definitively confirm that the experimental treatments (PMA and SAHA) are the absolute primary drivers of transcriptional change, encompassing the vast majority of the variance, while cell line identity acts as a robust secondary driver that structures the data once the drug impact is accounted for.
+
+## QUESTION 7 - Predict the data.
+
+
+Explore the effect of predicting a subset of the data from previous UMAP
+analysis. To do so, split your normalized data into two sets: 75% and
+25%. Use the 75% for creating a UMAP analysis and use the 25% left for
+predicting results. Compare results with the UMAP obtained in question 6
+with all data.
+
+### 7.1 Side by side
+
+```{r side by side prediction, fig.width=11,cache=TRUE}
+
+clean_samples <- rownames(umap_coords_norm)
+counts_norm_raw_clean <- counts_norm_raw[clean_samples, ]
+meta_clean <- metadata[clean_samples, ]
+
+set.seed(42)
+n_total <- nrow(counts_norm_raw_clean)
+train_indices <- sample(seq_len(n_total), size = floor(0.75 * n_total))
+
+data_train <- counts_norm_raw_clean[train_indices, ]
+data_test  <- counts_norm_raw_clean[-train_indices, ]
+
+meta_train <- meta_clean[train_indices, ]
+meta_test  <- meta_clean[-train_indices, ]
+
+umap_model_train <- umap::umap(as.matrix(data_train))
+
+umap_prediction <- predict(umap_model_train, as.matrix(data_test))
+
+df_train <- data.frame(
+  UMAP1 = umap_model_train$layout[, 1],
+  UMAP2 = umap_model_train$layout[, 2],
+  group = meta_train$group,
+  treatment = meta_train$treatment,
+  cell_type = meta_train$cell_type,
+  replicate = meta_train$replicate,
+  Subset = "Train (75%)"
+)
+
+df_test <- data.frame(
+  UMAP1 = umap_prediction[, 1],
+  UMAP2 = umap_prediction[, 2],
+  group = meta_test$group,
+  treatment = meta_test$treatment,
+  cell_type = meta_test$cell_type,
+  replicate = meta_test$replicate,
+  Subset = "Predicted (25%)"
+)
+
+df_prediction_combined <- rbind(df_train, df_test)
+
+p_original <- ggplot(umap_coords_norm, aes(x = UMAP1, y = UMAP2)) +
+  geom_point(aes(color = treatment, shape = cell_type), size = 3, alpha = 0.8) +
+  scale_color_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(title = "Original UMAP (100% Data)", subtitle = "Full dataset projection",
+       x = "UMAP 1", y = "UMAP 2") +
+  theme_hospital_bio() +
+  theme(legend.position = "none")
+
+p_predicted <- ggplot(df_prediction_combined, aes(x = UMAP1, y = UMAP2)) +
+  geom_point(aes(color = treatment, shape = cell_type, alpha = Subset), size = 3) +
+  scale_alpha_manual(values = c("Train (75%)" = 0.3, "Predicted (25%)" = 1)) +
+  scale_color_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(title = "Prediction UMAP (75% Train / 25% Test)",
+       subtitle = "Solid = Predicted (25%) | Faded = Training (75%)",
+       x = "UMAP 1", y = "UMAP 2", alpha = "Dataset Split") +
+  theme_hospital_bio() +
+  theme(legend.position = "right")
+
+grid.arrange(p_original, p_predicted, ncol = 2, widths = c(1, 1.3))
+
+ggsave("umap_Prediction.png", width = 16, height = 10, dpi = 300)
+
+```
+
+### 7.2 Prediction analysis
+
+Global Map Rotation: When comparing the full dataset UMAP (left) with
+the prediction UMAP (right), we can see that the clusters rotated and
+changed positions. For example, the PMA group moved from the top-left to
+the bottom-right. This is normal because UMAP is a stochastic algorithm.
+Changing the input data to a 75% subset initializes a different
+coordinate space, but the relative distances between the biological
+groups stay the same.
+
+High Prediction Accuracy: The map on the right proves that the UMAP
+model works very well with new data. The solid points show the 25% test
+samples projected onto the 75% training map (faded points). Every single
+solid point lands inside its correct treatment and cell-type cluster.
+
+Conclusion: There is no mixing or misclassification of the unseen
+samples. This proves that our total expression normalization captured
+the real biological signatures, allowing the UMAP model to learn the
+rules from a subset of the data and accurately place new samples.
+
+## QUESTION 8 - Explore parameters.
+
+Explore parameters for the UMAP algorithm using the normalized dataset:
+number of neighbors, minimum distance and a third parameter of your
+choice.
+
+### Different metrics {.tabset .tabset-pills}
+
+#### 8.1 number of neighbors
+The n_neighbors (number of neighbors) parameter is one of the foundational tuning knobs in the UMAP algorithm. It dictates the size of the local neighborhood the algorithm evaluates when attempting to map the manifold (the underlying shape) of our high-dimensional data.
+
+```{r number of neighbors, cache=TRUE, warning=FALSE, message=FALSE}
+neighbors_list <- c(3, 5, 15, 30)
+
+umap_neighbors_list <- lapply(neighbors_list, function(n) {
+  run_umap(counts_norm_raw, n_neighbors = n, min_dist = 0.1)
+})
+
+df_neighbors_animated <- do.call(rbind, lapply(seq_along(neighbors_list), function(i) {
+  data.frame(
+    UMAP1 = umap_neighbors_list[[i]]$layout[, 1],
+    UMAP2 = umap_neighbors_list[[i]]$layout[, 2],
+    treatment = metadata$treatment,
+    cell_type = metadata$cell_type,
+    n_neighbors = factor(neighbors_list[i], levels = neighbors_list)
+  )
+}))
+
+p_neighbors <- plot_ly(df_neighbors_animated, 
+                       x = ~UMAP1, y = ~UMAP2, 
+                       color = ~treatment, 
+                       colors = treatment_colours,
+                       symbol = ~cell_type, 
+                       symbols = c("circle", "triangle-up"),
+                       frame = ~n_neighbors,
+                       text = ~paste("n_neighbors:", n_neighbors, "<br>Treatment:", treatment, "<br>Cell type:", cell_type),
+                       hoverinfo = "text",
+                       type = 'scatter', mode = 'markers', marker = list(size = 10)) %>%
+  layout(title = "UMAP: Effect of n_neighbors (use slider to animate)",
+         xaxis = list(title = "UMAP Dimension 1"), yaxis = list(title = "UMAP Dimension 2"),
+         font = list(family = "Arial", size = 12, color = "#4A2323"),
+         title = list(font = list(color = "#800000", face = "bold")),
+         plot_bgcolor = "#FFFFFF", paper_bgcolor = "#FCFBFB",
+         annotations = list(text = "Lower n_neighbors = more local structure | Higher = more global",
+                            x = 0.5, y = -0.12, xref = "paper", yref = "paper",
+                            showarrow = FALSE, font = list(size = 11))) %>%
+  animation_opts(frame = 1000, transition = 500, redraw = TRUE) %>%
+  animation_button(x = 1, xanchor = "right", y = 0, yanchor = "bottom")
+
+p_neighbors
+```
+::: {style="background-color: #eaf2f8; color: #21618c; padding: 15px; border-left: 4px solid #3498db; border-radius: 4px; margin-bottom: 15px;"}
+
+At n_neighbors = 3: The algorithm acts highly myopic, focusing only on the absolute closest data points, which causes the biological groups to fracture into scattered, noisy, and artificially fragmented micro-clusters.
+
+At n_neighbors = 5: UMAP slightly broadens its local view, allowing the algorithm to start connecting similar cells and merging those scattered fragments into looser, but more recognizable, treatment-based groups.
+
+At n_neighbors = 30: The algorithm successfully captures the global topological structure of the dataset, compressing the data into three tight, robust macro-clusters that perfectly reflect the true biological drivers (the PMA, SAHA, and DMSO treatments).
+
+This parameter balances local detail versus global structure; low values highlight microscopic variations, while higher values smooth the data out to reveal the true macroscopic patterns.
+::: 
+
+#### 8.2 minimum distance
+The min_dist (minimum distance) parameter is a critical aesthetic and structural setting in UMAP. It literally dictates how tightly the algorithm is allowed to pack points together in the final low-dimensional projection.
+
+```{r minimum distance, cache=TRUE, warning=FALSE, message=FALSE}
+dist_list <- c(0.01, 0.1, 0.5, 0.9)
+
+umap_dist_list <- lapply(dist_list, function(d) {
+  run_umap(counts_norm_raw, n_neighbors = 15, min_dist = d)
+})
+
+df_dist_animated <- do.call(rbind, lapply(seq_along(dist_list), function(i) {
+  data.frame(
+    UMAP1 = umap_dist_list[[i]]$layout[, 1],
+    UMAP2 = umap_dist_list[[i]]$layout[, 2],
+    treatment = metadata$treatment,
+    cell_type = metadata$cell_type,
+    min_dist = factor(dist_list[i], levels = dist_list)
+  )
+}))
+
+p_dist <- plot_ly(df_dist_animated, 
+                  x = ~UMAP1, y = ~UMAP2, 
+                  color = ~treatment, 
+                  colors = treatment_colours,
+                  symbol = ~cell_type, 
+                  symbols = c("circle", "triangle-up"),
+                  frame = ~min_dist,
+                  text = ~paste("min_dist:", min_dist, "<br>Treatment:", treatment, "<br>Cell type:", cell_type),
+                  hoverinfo = "text",
+                  type = 'scatter', mode = 'markers', marker = list(size = 10)) %>%
+  layout(title = "UMAP: Effect of min_dist (use slider to animate)",
+         xaxis = list(title = "UMAP Dimension 1"), yaxis = list(title = "UMAP Dimension 2"),
+         font = list(family = "Arial", size = 12, color = "#4A2323"),
+         title = list(font = list(color = "#800000", face = "bold")),
+         plot_bgcolor = "#FFFFFF", paper_bgcolor = "#FCFBFB",
+         annotations = list(text = "Lower min_dist = tighter clusters | Higher = more spread out",
+                            x = 0.5, y = -0.12, xref = "paper", yref = "paper",
+                            showarrow = FALSE, font = list(size = 11))) %>%
+  animation_opts(frame = 1000, transition = 500, redraw = TRUE) %>%
+  animation_button(x = 1, xanchor = "right", y = 0, yanchor = "bottom")
+
+p_dist
+```
+::: {style="background-color: #eaf2f8; color: #21618c; padding: 15px; border-left: 4px solid #3498db; border-radius: 4px; margin-bottom: 15px;"}
+
+At min_dist = 0.01 (Extremely tight): The algorithm is allowed to pack the points virtually on top of each other. This results in incredibly dense, tight blobs. While it makes the macro-clusters visually unmistakable and far apart, it heavily compresses the internal micro-structure, making it harder to clearly distinguish the Jurkat vs. J-LatA2 sub-populations.
+
+At min_dist = 0.1 to 0.5 (Moderate spread): As we increase the value, we force UMAP to respect more personal space between the data points. The clusters start to expand. It prevents overlapping and reveals the internal geometry (allowing us to clearly see the separation of shapes within the colors).
+
+At min_dist = 0.9 (Extremely loose): The algorithm forces a massive amount of space between points. The clusters become highly dispersed and diffuse clouds. If pushed too far, the overarching global structure begins to degrade, and distinct biological groups (like the blue DMSO and red PMA clusters) start bleeding into each other's territory.
+::: 
+
+#### 8.3 metric
+The metric parameter is the foundational "ruler" UMAP uses to measure the high-dimensional space before it even begins to project the data down to 2D. While n_neighbors and min_dist control how the map is drawn, metric dictates how the algorithm defines similarity between any two cells in the first place.
+
+```{r metric, cache=TRUE, warning=FALSE, message=FALSE}
+metric_list <- c("euclidean", "manhattan", "cosine", "pearson")
+
+plots_metric <- lapply(metric_list, function(m) {
+  u_obj <- run_umap(counts_norm_raw, metric = m)
+  
+  df <- data.frame(
+    UMAP1 = u_obj$layout[, 1],
+    UMAP2 = u_obj$layout[, 2],
+    treatment = metadata$treatment,
+    cell_type = metadata$cell_type
+  )
+  
+  ggplot(df, aes(x = UMAP1, y = UMAP2, colour = treatment, shape = cell_type)) +
+    geom_point(size = 2.5, alpha = 0.8) +
+    scale_colour_manual(values = treatment_colours, name = "Treatment") +
+    scale_shape_manual(values = cell_shapes, name = "Cell type") +
+    labs(title = paste("metric =", m)) +
+    theme_hospital_bio() +
+    theme(legend.position = "none")
+})
+
+legend_plot <- ggplot(metadata, aes(x = 1, y = 1, colour = treatment, shape = cell_type)) +
+  geom_point(size = 4) +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  theme_void() +
+  theme(legend.position = "right")
+
+library(cowplot)
+legend_only <- get_legend(legend_plot)
+
+grid.arrange(
+  arrangeGrob(grobs = plots_metric, ncol = 2),
+  legend_only, ncol = 2, widths = c(4, 0.8),
+  top = grid::textGrob("UMAP: Exploring distance metrics", gp = grid::gpar(fontface = "bold", fontsize = 14))
+)
+```
+
+**euclidean:** This is the default metric. It calculates the standard geometric straight-line distance between two points. It generally performs well and produces the baseline, well-rounded clusters you see in the top-left panel, with clear separation between the three treatments.
+
+**manhattan:** Instead of a straight line, this calculates the sum of the absolute differences along all dimensions. In highly dimensional biological data, Manhattan distance is sometimes less sensitive to extreme outliers in a single gene. Notice how the PMA (red) and SAHA (orange) clusters in the top-right become significantly denser and more tightly packed compared to Euclidean.
+
+**cosine (The angle):** Cosine distance measures the angle between two vectors, ignoring their absolute magnitude. This is incredibly powerful for RNA-seq data, because it focuses on the relative shape of the expression profile rather than the absolute library size. We can notice how the clusters in the bottom-left take on a slightly more stretched, arc-like topology while maintaining distinct biological boundaries.
+
+**pearson (The correlation):** This metric is based on the Pearson correlation coefficient, meaning it measures how strongly the linear relationship between two expression profiles tracks together. For mean-centered data, it behaves very similarly to Cosine. In the bottom-right panel, the clusters are rotated and structured slightly differently, grouping cells by their correlated transcriptomic shifts.
+
+
+
+## QUESTION 9 - Final interpretation
+
+### 9.1 UMAP data preparation
+
+```{r Data preparation, cache=TRUE}
+common_samples <- rownames(umap_coords_norm)
+
+# PCA Data - SIN replicate
+df_pca <- data.frame(
+  Cell      = common_samples,
+  Dim1      = sc_norm[common_samples, "PC1"],
+  Dim2      = sc_norm[common_samples, "PC2"],
+  Method    = "PCA",
+  group     = metadata[common_samples, "group"],
+  cell_type = metadata[common_samples, "cell_type"],
+  treatment = metadata[common_samples, "treatment"],
+  stringsAsFactors = FALSE
+)
+
+# t-SNE Data - SIN replicate
+df_tsne <- data.frame(
+  Cell      = common_samples,
+  Dim1      = df_tsne_final[common_samples, "tSNE1"],
+  Dim2      = df_tsne_final[common_samples, "tSNE2"],
+  Method    = "t-SNE",
+  group     = metadata[common_samples, "group"],
+  cell_type = metadata[common_samples, "cell_type"],
+  treatment = metadata[common_samples, "treatment"],
+  stringsAsFactors = FALSE
+)
+
+# UMAP Data - SIN replicate
+df_umap <- data.frame(
+  Cell      = common_samples,
+  Dim1      = umap_coords_norm[common_samples, "UMAP1"],
+  Dim2      = umap_coords_norm[common_samples, "UMAP2"],
+  Method    = "UMAP",
+  group     = metadata[common_samples, "group"],
+  cell_type = metadata[common_samples, "cell_type"],
+  treatment = metadata[common_samples, "treatment"],
+  stringsAsFactors = FALSE
+)
+
+df_long <- dplyr::bind_rows(df_pca, df_tsne, df_umap)
+df_long$Method <- factor(df_long$Method, levels = c("PCA", "t-SNE", "UMAP"))
+
+```
+
+### 9.2 Comparison ploting alternatives {.tabset .tabset-pills}
+
+#### 9.2.1 Alternative 1
+
+```{r Alternative 1 Comparison, fig.width = 9}
+alt1_pca <- ggplot(df_pca, aes(x = Dim1, y = Dim2, colour = treatment, shape = cell_type)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(title = "PCA", x = "PC 1", y = "PC 2") +
+  theme_hospital_bio() +
+  theme(legend.position = "none")
+
+alt1_tsne <- ggplot(df_tsne, aes(x = Dim1, y = Dim2, colour = treatment, shape = cell_type)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(title = "t-SNE", x = "t-SNE 1", y = "t-SNE 2") +
+  theme_hospital_bio() +
+  theme(legend.position = "none")
+
+alt1_umap <- ggplot(df_umap, aes(x = Dim1, y = Dim2, colour = treatment, shape = cell_type)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(title = "UMAP", x = "UMAP 1", y = "UMAP 2") +
+  theme_hospital_bio() +
+  theme(legend.position = "right")
+
+alt1_combined <- (alt1_pca | alt1_tsne | alt1_umap) + 
+  plot_annotation(title = "Alternative 1: Dimensionality Reductions",
+                  theme = theme(plot.title = element_text(size = 14, face = "bold"))) &
+  theme_hospital_bio()
+
+print(alt1_combined)
+```
+
+We placed our three dimensionality reduction methods side-by-side to establish a clear baseline comparison of how each algorithm handles the dataset's variance. Looking at the scatter plots, we can see that while PCA captures the massive linear shift caused by the treatments along the axes, it compresses the data too much to fully isolate the cell lines. In contrast, t-SNE and UMAP excel at unpacking these tighter, local sub-clusters, cleanly dividing the Jurkat and J-LatA2 cells within each distinct treatment island.
+
+
+#### 9.2.2 Alternative 2
+
+```{r Alternative 2 Comparison}
+alt2_facet_plot <- ggplot(df_long, aes(x = Dim1, y = Dim2, colour = treatment, shape = cell_type)) +
+  geom_point(alpha = 0.8, size = 2, stroke = 0.5) +
+  stat_ellipse(geom = "polygon", alpha = 0.10, level = 0.95, linetype = "dashed", linewidth = 0.35) +
+  facet_wrap(~ Method, scales = "free", nrow = 1) +
+  scale_colour_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(
+    title = "Alternative 2: Tidy Facet-Wrap Comparison",
+    subtitle = "95% confidence ellipses showing group separation",
+    x = "Dimension 1", y = "Dimension 2"
+  ) +
+  theme_hospital_bio() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "right")
+
+print(alt2_facet_plot)
+```
+
+To better evaluate the statistical robustness of these groupings, we added 95% confidence intervals using a tidy facet-wrap approach. These shaded ellipses are incredibly helpful for us to visually prove our observations: in the PCA plot, the confidence regions stretch and slightly converge, whereas in the t-SNE and UMAP projections, the ellipses confirm that our treatment macro-clusters are highly cohesive, strictly separated, and have perfectly defined boundaries.
+
+
+#### 9.2.3 Alternative 3
+
+```{r Alternative 3 Comparison}
+compute_centroids <- function(df) {
+  df |> dplyr::group_by(treatment, cell_type) |>
+    dplyr::summarise(centroid_x = mean(Dim1, na.rm = TRUE),
+                     centroid_y = mean(Dim2, na.rm = TRUE),
+                     .groups = "drop") |>
+    dplyr::mutate(group = paste(treatment, cell_type, sep = "_"))
+}
+
+build_spider_plot <- function(df, method_label) {
+  centroids_df <- compute_centroids(df)
+  spider_df <- df |> dplyr::left_join(centroids_df, by = c("treatment", "cell_type"))
+  
+  ggplot() +
+    geom_segment(data = spider_df,
+                 aes(x = Dim1, y = Dim2, xend = centroid_x, yend = centroid_y, colour = treatment),
+                 alpha = 0.3, linewidth = 0.3) +
+    geom_point(data = spider_df, aes(x = Dim1, y = Dim2, colour = treatment, shape = cell_type),
+               size = 1.5, alpha = 0.7) +
+    geom_point(data = centroids_df, aes(x = centroid_x, y = centroid_y, colour = treatment),
+               shape = 8, size = 4, stroke = 1.2) +
+    ggrepel::geom_label_repel(data = centroids_df,
+                              aes(x = centroid_x, y = centroid_y, label = group, colour = treatment),
+                              size = 2.8, fontface = "bold", fill = "white", alpha = 0.8, show.legend = FALSE) +
+    scale_colour_manual(values = treatment_colours, name = "Treatment") +
+    scale_shape_manual(values = cell_shapes, name = "Cell type") +
+    labs(title = method_label, x = "Dim 1", y = "Dim 2") +
+    theme_hospital_bio() +
+    theme(plot.title = element_text(face = "bold", size = 12))
+}
+
+alt3_pca   <- build_spider_plot(df_pca, "PCA") + theme(legend.position = "none")
+alt3_tsne  <- build_spider_plot(df_tsne, "t-SNE") + theme(legend.position = "none")
+alt3_umap  <- build_spider_plot(df_umap, "UMAP") + theme(legend.position = "right")
+
+alt3_combined <- (alt3_pca | alt3_tsne | alt3_umap) + 
+  plot_annotation(title = "Alternative 3: Centroid Spider Plots",
+                  subtitle = "Colors = Treatment, Shapes = Cell type")
+print(alt3_combined)
+```
+
+We designed these centroid spider networks to explicitly map the internal geometry and spatial spread of each distinct biological subgroup. By anchoring every single cell to its calculated group centroid, we can immediately spot the intra-cluster variance. In the non-linear projections, the exceptionally short "spider legs" visually confirm the high density of the clusters and show us exactly where the Jurkat and J-LatA2 populations spatially diverge within the broader drug conditions.
+
+
+#### 9.2.4 Alternative 4
+
+```{r Alternative 4 Comparison, warning=FALSE, message=FALSE}
+df_long_plotly <- df_long |>
+  dplyr::mutate(
+    hover_label = paste0(
+      "<b>Sample:</b> ", Cell, "<br>",
+      "<b>Cell Type:</b> ", cell_type, "<br>",
+      "<b>Treatment:</b> ", treatment, "<br>",
+      "<b>Method:</b> ", Method
+    )
+  )
+
+alt4_gg <- ggplot(df_long_plotly, aes(x = Dim1, y = Dim2, color = treatment, shape = cell_type, text = hover_label)) + 
+  geom_point(alpha = 0.8, size = 2.5) +
+  facet_wrap(~ Method, scales = "free", nrow = 1) + 
+  scale_color_manual(values = treatment_colours, name = "Treatment") +
+  scale_shape_manual(values = cell_shapes, name = "Cell type") +
+  labs(title = "Alternative 4: Interactive Evaluation (Hover for Metadata)", 
+       x = "Dimension 1", y = "Dimension 2") +
+  theme_hospital_bio() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "right")
+
+alt4_plotly <- plotly::ggplotly(alt4_gg, tooltip = "text") %>%
+  plotly::layout(
+    font = list(family = "Arial", size = 12, color = "#4A2323"),
+    title = list(font = list(color = "#800000", face = "bold")),
+    plot_bgcolor = "#FFFFFF", paper_bgcolor = "#FCFBFB",
+    legend = list(orientation = "v", x = 1.02, y = 0.5, title = list(text = "")),
+    hoverlabel = list(bgcolor = "white", font = list(family = "Arial", color = "#4A2323"))
+  ) %>%
+  plotly::config(
+    displayModeBar = TRUE,
+    modeBarButtonsToRemove = c("autoScale2d", "hoverCompareCartesian",
+                               "hoverClosestCartesian", "toggleSpikelines")
+  )
+
+alt4_plotly
+```
+::: {style="background-color: #eaf2f8; color: #21618c; padding: 15px; border-left: 4px solid #3498db; border-radius: 4px; margin-bottom: 15px;"}
+Finally, we generated an interactive version of the faceted plots so we could actively explore the detailed metadata of any individual data point directly on the graph. While the overall structure mirrors our previous plots, this format is an essential tool for us when checking for potential batch outliers; it allows us to simply hover over any stray coordinate to instantly verify its exact replicate and experimental condition without cluttering the visual space.
+:::
+
+### 9.3 Comparison analysis
+::: well
+#### 9.3.1 Conclusions about the data itself:
+
+* **Treatment is the absolute driver:** The three plots consistently show that the latency-reversing drugs (PMA and SAHA) are the massive drivers of transcriptomic change, far outweighing baseline cell differences. 
+
+* **PMA triggers a massive transcriptional shock:** PMA-treated samples form the most isolated and distant clusters across all three methods. SAHA also cleanly separates from the DMSO controls, though with a milder effect compared to PMA's extreme reactivation.
+
+* **Cell type identity is secondary:** Because Jurkat and J-LatA2 share a nearly identical baseline, their intrinsic differences only become structurally apparent *after* isolating the treatment groups. 
+
+* **Biological signal beats batch effects:** Inside each treatment group, replicates form small sub-groups, confirming a manageable technical batch effect. However, a PMA sample from replicate 1 is fundamentally clustered with other PMA samples, proving biology > technical noise.
+:::
+
+
+::: well
+#### 9.3.2 How the techniques show our specific data:
+
+* **PCA:** Provides the linear big picture. It captures the massive treatment variance along PC1, cleanly splitting the heavily reactivated PMA samples from SAHA and DMSO. However, because it compresses local variance to prioritize global structure, the secondary cell-type differences remain harder to resolve globally.
+
+* **t-SNE:** Unpacks the compressed PCA clouds by focusing on local neighborhoods. It explicitly forms distinct macro-clusters for each treatment and, crucially, resolves clear sub-clusters for Jurkat and J-LatA2 *within* those treatment islands.
+
+* **UMAP:** Offers the best overall topological balance. It preserves the strong global treatment hierarchy (like PCA) while maintaining the tight, highly resolved local cell-type sub-clusters (like t-SNE) within each drug condition.
+:::
+
+::: well
+#### 9.3.3 Do we get to the same conclusions with the three methods?
+
+**Yes, absolutely.** Although PCA, t-SNE, and UMAP use different mathematical approaches and produce different geometric distributions, all three lead to identical biological conclusions:
+
+* **The primary biological driver is identical:** All algorithms agree that the experimental treatment—not the basal viral integration—forces the most extreme displacement in the transcriptome.
+
+* **The treatment hierarchy remains constant:** All three methods consistently show PMA causing the most extreme shift, SAHA driving a distinct intermediate state, and DMSO remaining at baseline.
+
+* **The batch effect behaves the same way:** In all three maps, replicates do not mix perfectly, proving that batch effects are a real but strictly secondary technical variation that must be computationally corrected prior to differential expression analysis.
+::: 
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```
+:::
